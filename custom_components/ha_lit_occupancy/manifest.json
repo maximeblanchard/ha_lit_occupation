@@ -1,0 +1,12 @@
+{
+  "domain": "ha_lit_occupancy",
+  "name": "Occupation du lit",
+  "codeowners": ["@maximeblanchard"],
+  "config_flow": true,
+  "documentation": "https://github.com/maximeblanchard/ha_lit_occupation",
+  "integration_type": "hub",
+  "iot_class": "local_push",
+  "issue_tracker": "https://github.com/maximeblanchard/ha_lit_occupation/issues",
+  "requirements": [],
+  "version": "1.1.0"
+}

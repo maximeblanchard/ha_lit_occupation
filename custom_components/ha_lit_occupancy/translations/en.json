@@ -1,0 +1,63 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Bed Occupancy",
+        "description": "Select the raw weight sensor to track and detection parameters.",
+        "data": {
+          "source_sensor": "Source weight sensor",
+          "baseline": "Starting value (empty bed) — auto-calibrates afterwards",
+          "tolerance_pct": "Tolerance (% of expected weight)",
+          "stability_seconds": "Required stability before confirming a change (s)",
+          "learning_enabled": "Automatically learn and refine occupants' weights"
+        }
+      },
+      "person": {
+        "title": "Occupant {count}",
+        "description": "Enter the name and an approximate starting weight (it will be refined automatically over time).",
+        "data": {
+          "name": "Name",
+          "weight": "Approximate starting weight",
+          "add_another": "Add another occupant"
+        }
+      }
+    },
+    "error": {
+      "invalid_name": "Name cannot be empty.",
+      "duplicate_name": "This occupant has already been added."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Bed Occupancy Settings",
+        "data": {
+          "source_sensor": "Source weight sensor",
+          "baseline": "Starting value (empty bed) — auto-calibrates afterwards",
+          "tolerance_pct": "Tolerance (% of expected weight)",
+          "stability_seconds": "Required stability before confirming a change (s)",
+          "learning_enabled": "Automatically learn and refine occupants' weights"
+        }
+      },
+      "persons_menu": {
+        "title": "Tracked Occupants",
+        "menu_options": {
+          "keep_persons": "Keep current occupants list",
+          "redo_persons": "Reconfigure occupants list"
+        }
+      },
+      "person": {
+        "title": "Occupant {count}",
+        "data": {
+          "name": "Name",
+          "weight": "Approximate starting weight",
+          "add_another": "Add another occupant"
+        }
+      }
+    },
+    "error": {
+      "invalid_name": "Name cannot be empty.",
+      "duplicate_name": "This occupant has already been added."
+    }
+  }
+}

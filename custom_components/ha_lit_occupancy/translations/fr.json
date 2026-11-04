@@ -1,0 +1,63 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Occupation du lit",
+        "description": "Choisis le capteur de poids brut à suivre et les paramètres de détection.",
+        "data": {
+          "source_sensor": "Capteur de poids source",
+          "baseline": "Valeur de départ (lit vide) — se recalibre automatiquement ensuite",
+          "tolerance_pct": "Tolérance (% du poids attendu)",
+          "stability_seconds": "Stabilité requise avant de valider un changement (s)",
+          "learning_enabled": "Apprendre et affiner automatiquement le poids des occupants"
+        }
+      },
+      "person": {
+        "title": "Occupant {count}",
+        "description": "Indique le prénom et un poids approximatif de départ (il sera affiné automatiquement au fil du temps).",
+        "data": {
+          "name": "Prénom / Nom",
+          "weight": "Poids approximatif de départ",
+          "add_another": "Ajouter un autre occupant"
+        }
+      }
+    },
+    "error": {
+      "invalid_name": "Le nom ne peut pas être vide.",
+      "duplicate_name": "Cet occupant a déjà été ajouté."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Paramètres d'occupation du lit",
+        "data": {
+          "source_sensor": "Capteur de poids source",
+          "baseline": "Valeur de départ (lit vide) — se recalibre automatiquement ensuite",
+          "tolerance_pct": "Tolérance (% du poids attendu)",
+          "stability_seconds": "Stabilité requise avant de valider un changement (s)",
+          "learning_enabled": "Apprendre et affiner automatiquement le poids des occupants"
+        }
+      },
+      "persons_menu": {
+        "title": "Occupants suivis",
+        "menu_options": {
+          "keep_persons": "Garder la liste actuelle des occupants",
+          "redo_persons": "Reconfigurer la liste des occupants"
+        }
+      },
+      "person": {
+        "title": "Occupant {count}",
+        "data": {
+          "name": "Prénom / Nom",
+          "weight": "Poids approximatif de départ",
+          "add_another": "Ajouter un autre occupant"
+        }
+      }
+    },
+    "error": {
+      "invalid_name": "Le nom ne peut pas être vide.",
+      "duplicate_name": "Cet occupant a déjà été ajouté."
+    }
+  }
+}
