@@ -1,4 +1,4 @@
-"""Entités sensor (poids réel estimé sur le lit et poids appris par personne)."""
+"""Entités sensor (poids estimé, poids appris et compteurs journaliers de temps)."""
 from __future__ import annotations
 
 from typing import Any
@@ -9,7 +9,7 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import UnitOfMass
+from homeassistant.const import UnitOfMass, UnitOfTime
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -18,22 +18,35 @@ from . import LitOccupancyHub
 from .const import CONF_NAME, CONF_PERSONS, DOMAIN
 
 
+def _format_duration(seconds: float) -> str:
+    """Formate une durée en secondes sous forme lisible 'Xh Ymin' ou 'Ymin'."""
+    total_sec = int(round(seconds))
+    hours = total_sec // 3600
+    minutes = (total_sec % 3600) // 60
+    if hours > 0:
+        return f"{hours}h {minutes:02d}min"
+    return f"{minutes}min"
+
+
 async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
 ) -> None:
-    """Configure les capteurs de poids estimé et de poids appris."""
+    """Configure les capteurs de poids et les compteurs journaliers de temps."""
     hub: LitOccupancyHub = hass.data[DOMAIN][entry.entry_id]
     config = {**entry.data, **entry.options}
 
     entities: list[SensorEntity] = [LitEstimatedWeightSensor(hub, entry)]
     for person in config.get(CONF_PERSONS, []):
-        entities.append(LitPersonLearnedWeightSensor(hub, entry, person[CONF_NAME]))
+        name = person[CONF_NAME]
+        entities.append(LitPersonLearnedWeightSensor(hub, entry, name))
+        entities.append(LitPersonInBedTimeSensor(hub, entry, name))
+        entities.append(LitPersonOutOfBedTimeSensor(hub, entry, name))
 
     async_add_entities(entities)
 
 
 class _LitBaseSensor(SensorEntity):
-    """Base commune pour les capteurs numériques du lit."""
+    """Base commune pour les capteurs numériques de poids du lit."""
 
     _attr_should_poll = False
     _attr_device_class = SensorDeviceClass.WEIGHT
@@ -127,4 +140,110 @@ class LitPersonLearnedWeightSensor(_LitBaseSensor):
             "echantillons_apprentissage": int(stats["sample_count"]),
             "ecart_moyen_kg": round(float(stats["avg_deviation"]), 2),
             "apprentissage_actif": self._hub.learning_enabled,
+        }
+
+
+class _LitBaseTimeSensor(SensorEntity):
+    """Base commune pour les compteurs journaliers de durée (au lit / hors du lit)."""
+
+    _attr_should_poll = False
+    _attr_device_class = SensorDeviceClass.DURATION
+    _attr_state_class = SensorStateClass.TOTAL
+    _attr_native_unit_of_measurement = UnitOfTime.HOURS
+    _attr_suggested_display_precision = 1
+
+    def __init__(self, hub: LitOccupancyHub, entry: ConfigEntry, name: str) -> None:
+        self._hub = hub
+        self._entry = entry
+        self._person_name = name
+
+    async def async_added_to_hass(self) -> None:
+        self._hub.async_add_listener(self._handle_update)
+
+    def _handle_update(self) -> None:
+        self.async_write_ha_state()
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        return DeviceInfo(
+            identifiers={(DOMAIN, self._entry.entry_id)},
+            name=self._entry.title or "Occupation du lit",
+            manufacturer="Occupation du lit",
+            model="Détection adaptative par delta de poids",
+        )
+
+
+class LitPersonInBedTimeSensor(_LitBaseTimeSensor):
+    """Compteur journalier du temps passé au lit par personne."""
+
+    _attr_icon = "mdi:bed-clock"
+
+    def __init__(self, hub: LitOccupancyHub, entry: ConfigEntry, name: str) -> None:
+        super().__init__(hub, entry, name)
+        self._attr_name = f"Temps au lit {name}"
+        self._attr_unique_id = f"{entry.entry_id}_{name}_time_in_bed"
+
+    @property
+    def native_value(self) -> float:
+        stats = self._hub.person_daily_stats.get(self._person_name)
+        if not stats:
+            return 0.0
+        sec = float(stats.get("in_bed_seconds", 0.0))
+        return round(sec / 3600.0, 2)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        stats = self._hub.person_daily_stats.get(self._person_name, {})
+        sec = float(stats.get("in_bed_seconds", 0.0))
+        yesterday_sec = float(stats.get("yesterday_in_bed_seconds", 0.0))
+        is_in_bed = self._person_name in self._hub.current_present
+        return {
+            "temps_formate": _format_duration(sec),
+            "total_secondes": int(round(sec)),
+            "total_minutes": round(sec / 60.0, 1),
+            "total_heures": round(sec / 3600.0, 2),
+            "temps_hier_formate": _format_duration(yesterday_sec),
+            "secondes_hier": int(round(yesterday_sec)),
+            "au_lit_actuellement": is_in_bed,
+            "derniere_entree_lit": stats.get("last_in_bed"),
+            "derniere_sortie_lit": stats.get("last_out_bed"),
+            "date": stats.get("date"),
+        }
+
+
+class LitPersonOutOfBedTimeSensor(_LitBaseTimeSensor):
+    """Compteur journalier du temps passé hors du lit par personne."""
+
+    _attr_icon = "mdi:walk"
+
+    def __init__(self, hub: LitOccupancyHub, entry: ConfigEntry, name: str) -> None:
+        super().__init__(hub, entry, name)
+        self._attr_name = f"Temps hors du lit {name}"
+        self._attr_unique_id = f"{entry.entry_id}_{name}_time_out_of_bed"
+
+    @property
+    def native_value(self) -> float:
+        stats = self._hub.person_daily_stats.get(self._person_name)
+        if not stats:
+            return 0.0
+        sec = float(stats.get("out_of_bed_seconds", 0.0))
+        return round(sec / 3600.0, 2)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        stats = self._hub.person_daily_stats.get(self._person_name, {})
+        sec = float(stats.get("out_of_bed_seconds", 0.0))
+        yesterday_sec = float(stats.get("yesterday_out_bed_seconds", 0.0))
+        is_in_bed = self._person_name in self._hub.current_present
+        return {
+            "temps_formate": _format_duration(sec),
+            "total_secondes": int(round(sec)),
+            "total_minutes": round(sec / 60.0, 1),
+            "total_heures": round(sec / 3600.0, 2),
+            "temps_hier_formate": _format_duration(yesterday_sec),
+            "secondes_hier": int(round(yesterday_sec)),
+            "au_lit_actuellement": is_in_bed,
+            "derniere_entree_lit": stats.get("last_in_bed"),
+            "derniere_sortie_lit": stats.get("last_out_bed"),
+            "date": stats.get("date"),
         }

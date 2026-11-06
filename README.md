@@ -35,14 +35,23 @@ Chaque capteur binaire expose également en attributs :
 | `echantillons_apprentissage` | *(Sur l'entité d'une personne)* Nombre de paliers stables appris |
 | `ecart_moyen_kg` | *(Sur l'entité d'une personne)* Variabilité moyenne observée (kg) |
 
-### Capteurs de poids (`sensor`)
+### Capteurs de poids et compteurs de temps (`sensor`)
 
-Les capteurs numériques ont `device_class: weight` et `state_class: measurement` : ils alimentent les statistiques à long terme de Home Assistant et peuvent être tracés dans vos graphiques historiques.
+Les capteurs numériques alimentent les statistiques à long terme de Home Assistant et peuvent être tracés dans vos tableaux de bord :
 
 | Entité | Description |
 |---|---|
 | `sensor.poids_estime_sur_le_lit` | **Vrai poids estimé sur le lit** ($\ge 0\text{ kg}$), corrigé de la baseline et insensible aux reboots/tares à `0 kg` de l'ESP |
 | `sensor.poids_appris_<nom>` | **Poids appris actuel** de chaque occupant (kg), mis à jour au fil des nuits |
+| `sensor.temps_au_lit_<nom>` | **Temps cumulé au lit aujourd'hui** (heures), avec affichage formaté `Xh Ymin`, reset auto à minuit et conservation du temps de la veille |
+| `sensor.temps_hors_du_lit_<nom>` | **Temps cumulé hors du lit aujourd'hui** (heures), avec affichage formaté `Xh Ymin`, reset auto à minuit et conservation du temps de la veille |
+
+Chaque capteur de temps expose en attributs :
+- `temps_formate` : durée lisible aujourd'hui (ex. `7h 45min`)
+- `total_secondes`, `total_minutes`, `total_heures`
+- `temps_hier_formate` : durée enregistrée hier
+- `au_lit_actuellement` : booléen (`true` / `false`)
+- `derniere_entree_lit` / `derniere_sortie_lit` : horodatage de la dernière transition
 
 ### Boutons d'action (`button`)
 

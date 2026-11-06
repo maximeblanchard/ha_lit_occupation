@@ -10,13 +10,18 @@ lors d'un redémarrage alors que le lit est occupé) en une détection fiable de
 """
 from __future__ import annotations
 
+from datetime import timedelta
 import itertools
 import logging
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import Event, HomeAssistant, State, callback
-from homeassistant.helpers.event import async_call_later, async_track_state_change_event
+from homeassistant.helpers.event import (
+    async_call_later,
+    async_track_state_change_event,
+    async_track_time_interval,
+)
 from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 
@@ -116,6 +121,13 @@ class LitOccupancyHub:
                 "avg_deviation": 0.0,
             }
 
+        # Statistiques journalières de temps au lit et hors du lit par personne
+        # {nom: {"date": "YYYY-MM-DD", "in_bed_seconds": float, "out_of_bed_seconds": float, ...}}
+        self.person_daily_stats: dict[str, dict[str, Any]] = {}
+        for p in self.persons:
+            name = p[CONF_NAME]
+            self.person_daily_stats[name] = self._make_default_daily_stats()
+
         # État courant confirmé (après stabilisation) : set des noms présents
         self.current_present: set[str] = set()
         # Dernière valeur brute connue du capteur, et dernier palier stable validé
@@ -132,9 +144,11 @@ class LitOccupancyHub:
         self._unsub_state: Any = None
         self._unsub_timer: Any = None
         self._unsub_learn_timer: Any = None
+        self._unsub_interval: Any = None
         self._pending_present: set[str] | None = None
         self._learning_samples: list[float] = []
         self._listeners: list[Any] = []
+        self._last_storage_save: float = dt_util.now().timestamp()
 
         self._store = Store[dict[str, Any]](
             hass, STORAGE_VERSION, f"{STORAGE_KEY_PREFIX}_{entry.entry_id}"
@@ -171,6 +185,100 @@ class LitOccupancyHub:
         if not self.learning_enabled:
             return float(stats["initial_weight"])
         return float(stats["learned_weight"])
+
+    def _make_default_daily_stats(self) -> dict[str, Any]:
+        """Génère la structure par défaut des compteurs journaliers pour une personne."""
+        today_str = dt_util.now().date().isoformat()
+        return {
+            "date": today_str,
+            "in_bed_seconds": 0.0,
+            "out_of_bed_seconds": 0.0,
+            "last_update": dt_util.now().timestamp(),
+            "last_in_bed": None,
+            "last_out_bed": None,
+            "yesterday_in_bed_seconds": 0.0,
+            "yesterday_out_bed_seconds": 0.0,
+        }
+
+    def _update_time_trackers(self, now: Any | None = None) -> bool:
+        """Met à jour les compteurs journaliers pour chaque personne.
+
+        Prend en compte le passage à minuit (rollover) pour archiver la veille
+        et réinitialiser le compteur du nouveau jour.
+        Retourne True si des compteurs ont été modifiés.
+        """
+        current_dt = now if now is not None else dt_util.now()
+        current_ts = current_dt.timestamp()
+        current_date_str = current_dt.date().isoformat()
+        changed = False
+
+        for p in self.persons:
+            name = p[CONF_NAME]
+            stats = self.person_daily_stats.setdefault(
+                name, self._make_default_daily_stats()
+            )
+            last_ts = float(stats.get("last_update", current_ts))
+            elapsed = max(0.0, current_ts - last_ts)
+            stats["last_update"] = current_ts
+
+            if elapsed <= 0.0:
+                continue
+
+            changed = True
+            is_in_bed = name in self.current_present
+            saved_date = stats.get("date", current_date_str)
+
+            if saved_date == current_date_str:
+                if is_in_bed:
+                    stats["in_bed_seconds"] = stats.get("in_bed_seconds", 0.0) + elapsed
+                else:
+                    stats["out_of_bed_seconds"] = (
+                        stats.get("out_of_bed_seconds", 0.0) + elapsed
+                    )
+            else:
+                # Minuit a été franchi entre last_ts et current_ts
+                midnight_today = current_dt.replace(
+                    hour=0, minute=0, second=0, microsecond=0
+                )
+                midnight_ts = midnight_today.timestamp()
+
+                elapsed_yesterday = max(0.0, min(elapsed, midnight_ts - last_ts))
+                elapsed_today = max(0.0, current_ts - max(last_ts, midnight_ts))
+
+                if is_in_bed:
+                    yesterday_total = (
+                        stats.get("in_bed_seconds", 0.0) + elapsed_yesterday
+                    )
+                    stats["yesterday_in_bed_seconds"] = round(yesterday_total, 1)
+                    stats["yesterday_out_bed_seconds"] = round(
+                        stats.get("out_of_bed_seconds", 0.0), 1
+                    )
+                    stats["in_bed_seconds"] = elapsed_today
+                    stats["out_of_bed_seconds"] = 0.0
+                else:
+                    yesterday_total = (
+                        stats.get("out_of_bed_seconds", 0.0) + elapsed_yesterday
+                    )
+                    stats["yesterday_out_bed_seconds"] = round(yesterday_total, 1)
+                    stats["yesterday_in_bed_seconds"] = round(
+                        stats.get("in_bed_seconds", 0.0), 1
+                    )
+                    stats["in_bed_seconds"] = 0.0
+                    stats["out_of_bed_seconds"] = elapsed_today
+
+                stats["date"] = current_date_str
+
+        return changed
+
+    @callback
+    def _async_periodic_tracker_update(self, now: Any) -> None:
+        """Appelé périodiquement toutes les 30 secondes pour rafraîchir les capteurs de temps."""
+        if self._update_time_trackers(now):
+            self._notify_listeners()
+            current_ts = dt_util.now().timestamp()
+            if current_ts - self._last_storage_save > 900:  # 15 minutes
+                self._last_storage_save = current_ts
+                self._schedule_save()
 
     async def async_load_storage(self) -> None:
         """Charge la baseline et les poids appris depuis le stockage persistant."""
@@ -214,10 +322,42 @@ class LitOccupancyHub:
                         stats["sample_count"] = int(s.get("sample_count", 0))
                         stats["avg_deviation"] = float(s.get("avg_deviation", 0.0))
 
+        # Restauration des compteurs journaliers
+        stored_daily = stored.get("person_daily_stats", {})
+        if isinstance(stored_daily, dict):
+            today_str = dt_util.now().date().isoformat()
+            yesterday_str = (dt_util.now().date() - timedelta(days=1)).isoformat()
+            for name, stats in self.person_daily_stats.items():
+                if name in stored_daily and isinstance(stored_daily[name], dict):
+                    sd = stored_daily[name]
+                    saved_date = sd.get("date")
+                    if saved_date == today_str:
+                        stats["in_bed_seconds"] = float(sd.get("in_bed_seconds", 0.0))
+                        stats["out_of_bed_seconds"] = float(
+                            sd.get("out_of_bed_seconds", 0.0)
+                        )
+                        stats["yesterday_in_bed_seconds"] = float(
+                            sd.get("yesterday_in_bed_seconds", 0.0)
+                        )
+                        stats["yesterday_out_bed_seconds"] = float(
+                            sd.get("yesterday_out_bed_seconds", 0.0)
+                        )
+                        stats["last_in_bed"] = sd.get("last_in_bed")
+                        stats["last_out_bed"] = sd.get("last_out_bed")
+                    elif saved_date == yesterday_str:
+                        stats["yesterday_in_bed_seconds"] = float(
+                            sd.get("in_bed_seconds", 0.0)
+                        )
+                        stats["yesterday_out_bed_seconds"] = float(
+                            sd.get("out_of_bed_seconds", 0.0)
+                        )
+                        stats["last_in_bed"] = sd.get("last_in_bed")
+                        stats["last_out_bed"] = sd.get("last_out_bed")
+
         self._rebuild_combinations()
 
     async def async_save_storage(self) -> None:
-        """Sauvegarde la baseline et les poids appris sur disque."""
+        """Sauvegarde la baseline, les poids appris et compteurs de temps sur disque."""
         data = {
             "schema_version": STORAGE_SCHEMA_VERSION,
             "baseline": round(self.baseline, 3),
@@ -229,6 +369,7 @@ class LitOccupancyHub:
             ),
             "current_present": sorted(self.current_present),
             "person_stats": self.person_stats,
+            "person_daily_stats": self.person_daily_stats,
         }
         await self._store.async_save(data)
 
@@ -249,6 +390,9 @@ class LitOccupancyHub:
         self._unsub_state = async_track_state_change_event(
             self.hass, [self.source_sensor], self._async_source_changed
         )
+        self._unsub_interval = async_track_time_interval(
+            self.hass, self._async_periodic_tracker_update, timedelta(seconds=30)
+        )
         state = self.hass.states.get(self.source_sensor)
         if state is not None:
             self._handle_new_value(state)
@@ -258,6 +402,9 @@ class LitOccupancyHub:
         if self._unsub_state:
             self._unsub_state()
             self._unsub_state = None
+        if self._unsub_interval:
+            self._unsub_interval()
+            self._unsub_interval = None
         if self._unsub_timer:
             self._unsub_timer()
             self._unsub_timer = None
@@ -432,8 +579,19 @@ class LitOccupancyHub:
         previous_present = set(self.current_present)
         previous_stable_raw = self.last_stable_raw
 
+        # Met à jour les compteurs de temps sur l'état précédent avant la transition
+        self._update_time_trackers()
+
         self.current_present = candidate
         self._pending_present = None
+
+        # Enregistre l'horodatage de la dernière entrée ou sortie pour chaque personne
+        now_iso = dt_util.now().isoformat()
+        for name in self.person_daily_stats:
+            if name in self.current_present and name not in previous_present:
+                self.person_daily_stats[name]["last_in_bed"] = now_iso
+            elif name not in self.current_present and name in previous_present:
+                self.person_daily_stats[name]["last_out_bed"] = now_iso
 
         if self._unsub_learn_timer:
             self._unsub_learn_timer()
