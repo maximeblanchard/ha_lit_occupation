@@ -2,8 +2,11 @@
 
 Transforme un capteur de poids brut (sujet à dérive du zéro ou à une tare à 0 kg
 lors d'un redémarrage alors que le lit est occupé) en une détection fiable de
-"qui est sur le lit", avec auto-calibration de la baseline et auto-apprentissage
-du poids réel de chaque occupant.
+"qui est sur le lit", en combinant :
+- l'analyse des paliers absolus (delta par rapport à la baseline),
+- la détection des fronts montants et descendants (variations brusques entre deux paliers),
+- l'auto-calibration bidirectionnelle de la baseline (lit vide),
+- l'auto-apprentissage progressif du poids réel de chaque occupant.
 """
 from __future__ import annotations
 
@@ -38,7 +41,11 @@ from .const import (
     LEARNING_FAST_SAMPLES,
     LEARNING_MAX_DRIFT_RATIO,
     LEARNING_SETTLE_SECONDS,
+    MIN_SIGNIFICANT_STEP_KG,
+    MULTI_PERSON_COUPLING,
+    STEP_MOTION_THRESHOLD_KG,
     STORAGE_KEY_PREFIX,
+    STORAGE_SCHEMA_VERSION,
     STORAGE_VERSION,
 )
 
@@ -76,7 +83,7 @@ async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> Non
 
 
 class LitOccupancyHub:
-    """Gère le suivi du poids, l'auto-calibration et l'apprentissage des poids."""
+    """Gère le suivi du poids, la détection de fronts, l'auto-calibration et l'apprentissage."""
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         self.hass = hass
@@ -111,14 +118,16 @@ class LitOccupancyHub:
 
         # État courant confirmé (après stabilisation) : set des noms présents
         self.current_present: set[str] = set()
-        # Dernière valeur brute connue du capteur, et confiance du dernier calcul
+        # Dernière valeur brute connue du capteur, et dernier palier stable validé
         self.last_raw: float | None = None
         self.last_stable_raw: float | None = None
         self.last_confident: bool = True
         self.last_calibrated: Any = None
+        self._baseline_verified: bool = False
 
-        # Suivi d'indisponibilité pour détecter un reboot de l'ESP à 0 kg
+        # Suivi d'indisponibilité pour détecter un vrai reboot de l'ESP à 0.0 kg
         self._source_was_unavailable: bool = False
+        self._raw_before_unavailable: float | None = None
 
         self._unsub_state: Any = None
         self._unsub_timer: Any = None
@@ -135,16 +144,24 @@ class LitOccupancyHub:
         self._rebuild_combinations()
 
     def _rebuild_combinations(self) -> None:
-        """Précalcule toutes les combinaisons possibles avec les poids appris."""
+        """Précalcule toutes les combinaisons possibles avec les poids appris.
+
+        Lorsqu'au moins 2 personnes sont ensemble sur le lit, on applique un léger
+        facteur de couplage (MULTI_PERSON_COUPLING = 0.92) car la répartition sur
+        le sommier/cadre réduit légèrement la somme brute mesurée par rapport à la
+        somme des poids individuels mesurés séparément.
+        """
         self._combinations = []
         names = [p[CONF_NAME] for p in self.persons]
-        weights = {
-            name: self.get_effective_weight(name) for name in names
-        }
+        weights = {name: self.get_effective_weight(name) for name in names}
         for r in range(0, len(names) + 1):
             for combo in itertools.combinations(names, r):
-                total = sum(weights[n] for n in combo)
-                self._combinations.append((frozenset(combo), total))
+                raw_sum = sum(weights[n] for n in combo)
+                if r >= 2:
+                    expected = raw_sum * MULTI_PERSON_COUPLING
+                else:
+                    expected = raw_sum
+                self._combinations.append((frozenset(combo), expected))
 
     def get_effective_weight(self, name: str) -> float:
         """Retourne le poids appris (ou initial si l'apprentissage est désactivé)."""
@@ -161,15 +178,28 @@ class LitOccupancyHub:
         if not stored:
             return
 
-        if "baseline" in stored and stored["baseline"] is not None:
-            self.baseline = float(stored["baseline"])
-        if stored.get("last_calibrated"):
-            self.last_calibrated = dt_util.parse_datetime(stored["last_calibrated"])
+        schema_version = stored.get("schema_version", 1)
+        if schema_version < STORAGE_SCHEMA_VERSION:
+            _LOGGER.info(
+                "Migration du stockage vers le schéma %d : purge de l'ancienne baseline potentiellement corrompue.",
+                STORAGE_SCHEMA_VERSION,
+            )
+            config = {**self.entry.data, **self.entry.options}
+            self.baseline = float(config.get(CONF_BASELINE, DEFAULT_BASELINE))
+            self._baseline_verified = False
+            self.current_present = set()
+        else:
+            if "baseline" in stored and stored["baseline"] is not None:
+                self.baseline = float(stored["baseline"])
+            if stored.get("last_calibrated"):
+                self.last_calibrated = dt_util.parse_datetime(stored["last_calibrated"])
+            if stored.get("baseline_verified"):
+                self._baseline_verified = bool(stored["baseline_verified"])
 
-        stored_present = stored.get("current_present")
-        if isinstance(stored_present, list):
-            valid_names = {p[CONF_NAME] for p in self.persons}
-            self.current_present = {n for n in stored_present if n in valid_names}
+            stored_present = stored.get("current_present")
+            if isinstance(stored_present, list):
+                valid_names = {p[CONF_NAME] for p in self.persons}
+                self.current_present = {n for n in stored_present if n in valid_names}
 
         stored_stats = stored.get("person_stats", {})
         if isinstance(stored_stats, dict):
@@ -177,8 +207,6 @@ class LitOccupancyHub:
                 if name in stored_stats:
                     s = stored_stats[name]
                     saved_init = float(s.get("initial_weight", stats["initial_weight"]))
-                    # Si l'utilisateur n'a pas changé manuellement le poids initial dans la config,
-                    # on restaure le poids appris. Sinon on repart du nouveau poids configuré.
                     if abs(saved_init - stats["initial_weight"]) < 0.1:
                         stats["learned_weight"] = float(
                             s.get("learned_weight", stats["initial_weight"])
@@ -191,7 +219,9 @@ class LitOccupancyHub:
     async def async_save_storage(self) -> None:
         """Sauvegarde la baseline et les poids appris sur disque."""
         data = {
+            "schema_version": STORAGE_SCHEMA_VERSION,
             "baseline": round(self.baseline, 3),
+            "baseline_verified": self._baseline_verified,
             "last_calibrated": (
                 self.last_calibrated.isoformat()
                 if hasattr(self.last_calibrated, "isoformat")
@@ -246,49 +276,39 @@ class LitOccupancyHub:
         try:
             raw = float(state.state)
         except (ValueError, TypeError):
-            # Capteur "unknown"/"unavailable" : typique d'un reboot de l'ESP.
-            self._source_was_unavailable = True
+            # Capteur "unknown"/"unavailable" : on mémorise le dernier poids stable
+            # avant la coupure pour distinguer une micro-coupure Wi-Fi d'un vrai reboot ESP.
+            if not self._source_was_unavailable:
+                self._source_was_unavailable = True
+                self._raw_before_unavailable = self.last_stable_raw or self.last_raw
             return
 
-        # Détection d'un reboot du capteur à 0 kg pendant que le lit était occupé :
-        # Si le capteur revient d'un état indisponible (ou saute brutalement à ~0 kg)
-        # alors que des personnes étaient confirmées sur le lit et que l'ancien poids
-        # brut était éloigné de zéro, le capteur vient de refaire sa tare avec les
-        # occupants dessus. On décale immédiatement la baseline de -(poids des occupants).
-        if (
-            self.current_present
-            and abs(raw) <= DEFAULT_EMPTY_TOLERANCE
-            and (
-                self._source_was_unavailable
-                or (
-                    self.last_raw is not None
-                    and abs(self.last_raw - raw) > DEFAULT_EMPTY_TOLERANCE * 3
-                    and abs(self.baseline) > DEFAULT_EMPTY_TOLERANCE
-                )
-            )
-        ):
-            occupants_weight = sum(
-                self.get_effective_weight(name) for name in self.current_present
-            )
-            if occupants_weight > DEFAULT_EMPTY_TOLERANCE:
-                _LOGGER.info(
-                    "Redémarrage probable du capteur détecté à %.2f kg avec %s sur le lit : "
-                    "ajustement automatique de la baseline à %.2f kg",
-                    raw,
-                    sorted(self.current_present),
-                    raw - occupants_weight,
-                )
-                self.async_recalibrate(raw - occupants_weight)
-
-        self._source_was_unavailable = False
+        prev_raw = self.last_raw
         self.last_raw = raw
 
-        candidate, confident = self._best_match(raw)
+        # Est-on en plein front montant ou descendant (variation rapide entre 2 mesures) ?
+        in_motion = (
+            prev_raw is not None and abs(raw - prev_raw) > STEP_MOTION_THRESHOLD_KG
+        )
+
+        # Si le capteur est en plein mouvement (front montant ou descendant en cours),
+        # on ne valide RIEN tout de suite : on relance le timer de stabilité pour
+        # attendre que le palier d'arrivée soit atteint et stable.
+        if in_motion:
+            candidate, confident = self._evaluate_candidate(raw)
+            self.last_confident = confident
+            self._pending_present = candidate
+            self._start_stability_timer()
+            self._notify_listeners()
+            return
+
+        candidate, confident = self._evaluate_candidate(raw)
         self.last_confident = confident
 
         # Collecte d'échantillons si une seule personne est stable sur le lit
         if (
             self.learning_enabled
+            and self._baseline_verified
             and candidate == self.current_present
             and len(self.current_present) == 1
             and confident
@@ -297,26 +317,27 @@ class LitOccupancyHub:
             if delta > DEFAULT_EMPTY_TOLERANCE:
                 self._learning_samples.append(delta)
 
-        if candidate == self.current_present:
+        # Vérifie si on a besoin de recalibrer la baseline alors que le lit est déjà vide
+        needs_baseline_update = (
+            not candidate
+            and not self.current_present
+            and abs(raw - self.baseline) > 1.5
+        )
+
+        if candidate == self.current_present and not needs_baseline_update:
             # L'état correspond déjà à l'état confirmé : on annule un éventuel
             # timer de changement d'état en attente.
             if self._unsub_timer:
                 self._unsub_timer()
                 self._unsub_timer = None
                 self._pending_present = None
-
-            # Si le lit est déjà vide et que le poids brut descend encore plus bas
-            # (ex: tare faite avec quelqu'un dans le lit, puis sortie du lit vers -80 kg)
-            # ou dérive légèrement dans la zone vide, on maintient la baseline à jour.
-            if not self.current_present and raw < self.baseline - DEFAULT_EMPTY_TOLERANCE:
-                self._pending_present = set()
-                self._start_stability_timer()
+            if self.last_stable_raw is None:
+                self.last_stable_raw = raw
             self._notify_listeners()
             return
 
-        # Si la même combinaison candidate est déjà en cours de stabilisation,
-        # on NE réinitialise PAS le timer (sinon chaque micro-variation du capteur
-        # repousserait indéfiniment la validation).
+        # Si la même combinaison candidate est déjà en cours de stabilisation et que
+        # le capteur n'est pas en mouvement brusque, on laisse le timer aller au bout.
         if self._pending_present == candidate and self._unsub_timer is not None:
             self._notify_listeners()
             return
@@ -344,13 +365,74 @@ class LitOccupancyHub:
         self._commit_pending()
 
     def _commit_pending(self) -> None:
-        if self._pending_present is None:
+        if self.last_raw is None:
             return
 
+        raw = self.last_raw
+
+        # 1. Vérification d'un VRAI reboot de l'ESP avec tare à 0.0 kg :
+        # Uniquement si :
+        # - le capteur vient de passer par unavailable/unknown,
+        # - le nouveau palier STABLE est revenu pile autour de 0.0 kg (|raw| <= 2.5 kg),
+        # - avant la coupure la valeur brute était nettement éloignée de 0 (|raw_before| > 15 kg),
+        # - et la variation par rapport à avant la coupure est importante (> 15 kg), ce qui
+        #   exclut une simple micro-coupure Wi-Fi où la valeur reste identique (ex: +3.3 -> unknown -> +3.3).
+        if (
+            self._source_was_unavailable
+            and abs(raw) <= 2.5
+            and self._raw_before_unavailable is not None
+            and abs(self._raw_before_unavailable) > 15.0
+            and abs(self._raw_before_unavailable - raw) > 15.0
+        ):
+            if not self.current_present:
+                # Le lit était vide avant le reboot : l'ESP s'est retaré à 0.0 kg pour le lit vide.
+                _LOGGER.info(
+                    "Reboot de l'ESP détecté à %.2f kg alors que le lit était vide (avant coupure: %.2f kg) : "
+                    "recalage automatique de la baseline à %.2f kg",
+                    raw,
+                    self._raw_before_unavailable,
+                    raw,
+                )
+                self.async_recalibrate(raw)
+                self._baseline_verified = True
+                self._source_was_unavailable = False
+                self._raw_before_unavailable = None
+                self.last_stable_raw = raw
+                self._pending_present = None
+                self.current_present = set()
+                self._schedule_save()
+                self._notify_listeners()
+                return
+
+            occupants_weight = self._expected_combo_weight(self.current_present)
+            if occupants_weight > DEFAULT_EMPTY_TOLERANCE:
+                _LOGGER.info(
+                    "Vrai reboot de l'ESP détecté à %.2f kg (avant coupure: %.2f kg) avec %s : "
+                    "ajustement de la baseline à %.2f kg",
+                    raw,
+                    self._raw_before_unavailable,
+                    sorted(self.current_present),
+                    raw - occupants_weight,
+                )
+                self.async_recalibrate(raw - occupants_weight)
+                self._source_was_unavailable = False
+                self._raw_before_unavailable = None
+                self.last_stable_raw = raw
+                self._pending_present = None
+                self._schedule_save()
+                self._notify_listeners()
+                return
+
+        self._source_was_unavailable = False
+        self._raw_before_unavailable = None
+
+        # 2. Réévalue le candidat sur la valeur stabilisée finale (en tenant compte du front)
+        candidate, confident = self._evaluate_candidate(raw)
+        self.last_confident = confident
         previous_present = set(self.current_present)
         previous_stable_raw = self.last_stable_raw
 
-        self.current_present = self._pending_present
+        self.current_present = candidate
         self._pending_present = None
 
         if self._unsub_learn_timer:
@@ -358,48 +440,64 @@ class LitOccupancyHub:
             self._unsub_learn_timer = None
         self._learning_samples.clear()
 
-        if self.last_raw is not None:
-            # Cas 1 : Le poids brut est négatif par rapport à la baseline actuelle
-            # (ex: capteur démarré à 0 kg alors que quelqu'un était dans le lit, puis
-            # la personne sort du lit et le capteur affiche -80 kg).
-            # Si on observe un saut vers le bas depuis le palier précédent, on peut même
-            # utiliser la valeur du saut pour affiner le poids si une seule personne est sortie !
+        # 3. Auto-calibration de la baseline dès que l'état stable confirmé est "lit vide" !
+        # Que la valeur brute soit plus basse que l'ancienne baseline (ex: -80 kg après un
+        # démarrage à 0 kg) OU plus haute qu'une baseline qui avait dérivé trop bas
+        # (ex: -80 kg après une dérive à -137 kg suite à un front descendant complet),
+        # le palier stable "lit vide" EST la nouvelle référence physique du lit vide.
+        if not self.current_present and confident:
+            step_drop = (
+                (previous_stable_raw - raw)
+                if previous_stable_raw is not None
+                else (self.baseline - raw)
+            )
             if (
-                not self.current_present
-                and self.last_raw < self.baseline - DEFAULT_EMPTY_TOLERANCE
+                self.learning_enabled
+                and len(previous_present) == 1
+                and step_drop > MIN_SIGNIFICANT_STEP_KG
             ):
-                step_drop = (
-                    (previous_stable_raw if previous_stable_raw is not None else self.baseline)
-                    - self.last_raw
-                )
-                if self.learning_enabled and step_drop > DEFAULT_EMPTY_TOLERANCE:
-                    self._try_learn_from_step(step_drop, previous_present)
+                self._try_learn_from_step(step_drop, previous_present)
 
+            if abs(raw - self.baseline) > 0.05 or not self._baseline_verified:
                 _LOGGER.info(
-                    "Poids stable inférieur à la baseline détecté (%.2f kg < %.2f kg) : "
-                    "recalibration automatique du lit vide à %.2f kg",
-                    self.last_raw,
+                    "État 'lit vide' stable confirmé à %.2f kg (ancienne baseline: %.2f kg) : "
+                    "calibration automatique de la baseline.",
+                    raw,
                     self.baseline,
-                    self.last_raw,
                 )
-                self.async_recalibrate(self.last_raw)
-                self.last_confident = True
+                self.async_recalibrate(raw)
+            self._baseline_verified = True
 
-            # Cas 2 : Auto-calibration normale quand le lit redevient vide avec confiance
-            elif not self.current_present and self.last_confident:
-                self.async_recalibrate(self.last_raw)
+        # 4. Auto-correction si la baseline était manifestement trop haute alors que tout le
+        # monde est dans le lit, ou trop basse (delta >> poids total de tous les occupants) :
+        elif self.current_present and len(self.current_present) == len(self.persons):
+            max_expected = self._expected_combo_weight(self.current_present)
+            delta = raw - self.baseline
+            # Si le delta dépasse de plus de 25 kg le poids de TOUS les occupants réunis,
+            # c'est que la baseline avait glissé anormalement bas : on la recale.
+            if max_expected > 0 and delta > max_expected + 25.0:
+                corrected_baseline = raw - max_expected
+                _LOGGER.warning(
+                    "Delta anormalement élevé (%.1f kg > max attendu %.1f kg) : "
+                    "correction automatique de la baseline de %.2f kg à %.2f kg",
+                    delta,
+                    max_expected,
+                    self.baseline,
+                    corrected_baseline,
+                )
+                self.async_recalibrate(corrected_baseline)
 
-            self.last_stable_raw = self.last_raw
+        self.last_stable_raw = raw
 
-        # Si une seule personne vient de s'installer dans le lit avec confiance,
-        # on planifie une session d'auto-apprentissage après stabilisation complète.
+        # 5. Si une seule personne est confirmée sur le lit avec une baseline vérifiée,
+        # on lance la fenêtre d'apprentissage de 20 secondes.
         if (
             self.learning_enabled
+            and self._baseline_verified
             and len(self.current_present) == 1
             and self.last_confident
-            and self.last_raw is not None
         ):
-            delta = self.last_raw - self.baseline
+            delta = raw - self.baseline
             if delta > DEFAULT_EMPTY_TOLERANCE:
                 self._learning_samples = [delta]
                 self._unsub_learn_timer = async_call_later(
@@ -411,28 +509,143 @@ class LitOccupancyHub:
         self._schedule_save()
         self._notify_listeners()
 
+    def _expected_combo_weight(self, combo: set[str] | frozenset[str]) -> float:
+        """Calcule le poids attendu d'un ensemble de personnes (avec couplage si >= 2)."""
+        raw_sum = sum(self.get_effective_weight(name) for name in combo)
+        if len(combo) >= 2:
+            return raw_sum * MULTI_PERSON_COUPLING
+        return raw_sum
+
+    def _evaluate_candidate(self, raw: float) -> tuple[set[str], bool]:
+        """Détermine qui est sur le lit en combinant l'analyse des fronts et le delta absolu.
+
+        Pourquoi combiner les deux ?
+        1. Si le poids descend nettement sous la baseline (ex: 0 kg -> -80 kg), le lit est vide.
+        2. Si on connaît l'état stable précédent (self.last_stable_raw et self.current_present)
+           et qu'un front franc (montant ou descendant >= 25 kg) vient de se produire :
+           - Un front descendant dont l'amplitude correspond au poids de TOUS les occupants
+             présents signifie que le lit vient de se vider complètement (même si la baseline
+             était décalée !).
+           - Un front descendant partiel (ex: -66 kg quand Maxime + Nhung étaient dans le lit)
+             indique qu'au moins une personne est sortie : on retire la personne dont le poids
+             correspond au front descendant.
+           - Un front montant franc (ex: +45 kg ou +67 kg) quand 1 personne était déjà dans le
+             lit indique qu'une autre personne vient de monter sur le lit.
+        """
+        delta = raw - self.baseline
+
+        # 1. Plancher sous la baseline : lit vide certain (ex: sortie du lit vers -80 kg)
+        if delta <= DEFAULT_EMPTY_TOLERANCE:
+            return set(), True
+
+        # 2. Analyse par front (step change) par rapport au dernier palier stable
+        if self.last_stable_raw is not None:
+            step = raw - self.last_stable_raw
+
+            # --- FRONT DESCENDANT FRANC (quelqu'un sort du lit) ---
+            if step <= -MIN_SIGNIFICANT_STEP_KG and self.current_present:
+                drop = -step  # valeur positive de la perte de poids
+                present_expected = self._expected_combo_weight(self.current_present)
+
+                # 2a. La perte de poids correspond-elle au départ de TOUS les occupants présents ?
+                # (ex: 1 personne de 54 kg présente et chute de 58 kg, ou 2 personnes = 128 kg et chute de 128 kg)
+                if present_expected > 0 and drop >= present_expected * 0.72:
+                    # Vérifie s'il ne reste pas quand même une personne clairement identifiable
+                    # lorsque 2 personnes étaient présentes et que seule la plus lourde est sortie :
+                    if len(self.current_present) >= 2:
+                        # Compare la chute (drop) avec le départ d'une seule personne vs tout le monde
+                        best_subset_rem, subset_err = self._best_remaining_after_drop(
+                            drop, raw
+                        )
+                        all_left_err = (
+                            abs(drop - present_expected) * 0.65
+                            + abs(raw - self.baseline) * 0.35
+                        )
+                        if best_subset_rem is not None and subset_err < all_left_err:
+                            return best_subset_rem, True
+                    return set(), True
+
+                # 2b. Départ partiel (ex: 2 personnes étaient sur le lit et 1 seule sort)
+                if len(self.current_present) >= 2:
+                    best_rem, _ = self._best_remaining_after_drop(drop, raw)
+                    if best_rem is not None:
+                        return best_rem, True
+
+            # --- FRONT MONTANT FRANC (quelqu'un monte sur le lit) ---
+            elif step >= MIN_SIGNIFICANT_STEP_KG:
+                gain = step
+                # Si des personnes étaient déjà présentes et qu'un front montant >= 30 kg
+                # survient, au moins une personne supplémentaire est montée sur le lit.
+                if self.current_present and len(self.current_present) < len(self.persons):
+                    best_added = self._best_added_after_gain(gain, raw)
+                    if best_added is not None:
+                        return best_added, True
+
+        # 3. Classement par plus proche voisin sur le delta absolu
+        return self._best_match(raw)
+
+    def _best_remaining_after_drop(
+        self, drop: float, raw: float
+    ) -> tuple[set[str] | None, float]:
+        """Trouve quel sous-ensemble strict d'occupants reste sur le lit après une chute de poids."""
+        present_list = list(self.current_present)
+        total_before = self._expected_combo_weight(self.current_present)
+        delta_after = raw - self.baseline
+
+        best_remaining: set[str] | None = None
+        best_score = float("inf")
+
+        # Teste tous les sous-ensembles non vides strictement plus petits que current_present
+        for r in range(1, len(present_list)):
+            for rem_tuple in itertools.combinations(present_list, r):
+                rem_set = set(rem_tuple)
+                rem_expected = self._expected_combo_weight(rem_set)
+                expected_drop = total_before - rem_expected
+                # Combine l'erreur sur l'amplitude du saut et (si la baseline est saine) l'erreur sur le palier restant
+                drop_err = abs(drop - expected_drop)
+                level_err = abs(delta_after - rem_expected)
+                score = drop_err * 0.65 + level_err * 0.35
+                if score < best_score:
+                    best_score = score
+                    best_remaining = rem_set
+
+        return best_remaining, best_score
+
+    def _best_added_after_gain(self, gain: float, raw: float) -> set[str] | None:
+        """Trouve quel sur-ensemble d'occupants est sur le lit après un front montant."""
+        all_names = {p[CONF_NAME] for p in self.persons}
+        absent_list = list(all_names - self.current_present)
+        if not absent_list:
+            return None
+
+        total_before = self._expected_combo_weight(self.current_present)
+        delta_after = raw - self.baseline
+
+        best_new_set: set[str] | None = None
+        best_score = float("inf")
+
+        for r in range(1, len(absent_list) + 1):
+            for added_tuple in itertools.combinations(absent_list, r):
+                new_set = self.current_present | set(added_tuple)
+                new_expected = self._expected_combo_weight(new_set)
+                expected_gain = new_expected - total_before
+                gain_err = abs(gain - expected_gain)
+                level_err = abs(delta_after - new_expected)
+                score = gain_err * 0.65 + level_err * 0.35
+                if score < best_score and gain >= expected_gain * 0.60:
+                    best_score = score
+                    best_new_set = new_set
+
+        return best_new_set
+
     def _try_learn_from_step(
         self, step_weight: float, previous_present: set[str]
     ) -> None:
-        """Apprend à partir d'une sortie franche du lit (ex: 0 kg -> -80 kg)."""
-        # Si une seule personne était connue sur le lit, ou s'il n'y a qu'une personne
-        # dont le poids correspond étroitement à ce saut
-        candidate_name: str | None = None
-        if len(previous_present) == 1:
-            candidate_name = next(iter(previous_present))
-        else:
-            matching = []
-            for p in self.persons:
-                name = p[CONF_NAME]
-                w = self.get_effective_weight(name)
-                tol = w * (self.tolerance_pct / 100.0) + LEARNING_ACCESSORY_OFFSET_KG
-                if abs(step_weight - w) <= tol:
-                    matching.append(name)
-            if len(matching) == 1:
-                candidate_name = matching[0]
-
-        if candidate_name:
-            self._update_person_learned_weight(candidate_name, step_weight)
+        """Apprend à partir d'une sortie franche d'une personne seule vers le lit vide."""
+        if len(previous_present) != 1:
+            return
+        candidate_name = next(iter(previous_present))
+        self._update_person_learned_weight(candidate_name, step_weight)
 
     @callback
     def _async_learn_settled_weight(self, _now: Any) -> None:
@@ -440,6 +653,7 @@ class LitOccupancyHub:
         self._unsub_learn_timer = None
         if (
             not self.learning_enabled
+            or not self._baseline_verified
             or len(self.current_present) != 1
             or not self.last_confident
             or not self._learning_samples
@@ -447,8 +661,6 @@ class LitOccupancyHub:
             return
 
         person_name = next(iter(self.current_present))
-        # On utilise la médiane des échantillons collectés pendant le repos
-        # pour ignorer les pics liés aux mouvements dans le lit.
         sorted_samples = sorted(self._learning_samples)
         mid = len(sorted_samples) // 2
         if len(sorted_samples) % 2 == 1:
@@ -464,7 +676,7 @@ class LitOccupancyHub:
     def _update_person_learned_weight(
         self, name: str, observed_weight: float
     ) -> bool:
-        """Met à jour le poids appris d'une personne avec protection contre les accessoires (PC, vêtements)."""
+        """Met à jour le poids appris d'une personne avec protection contre les accessoires."""
         stats = self.person_stats.get(name)
         if not stats:
             return False
@@ -482,24 +694,18 @@ class LitOccupancyHub:
         diff = observed_weight - current_w
         abs_diff = abs(diff)
 
-        # Choix de la vitesse d'apprentissage (rapide au début pour corriger le poids
-        # approximatif saisi par l'utilisateur, puis lente ensuite).
         alpha = (
             LEARNING_ALPHA_FAST
             if count < LEARNING_FAST_SAMPLES
             else LEARNING_ALPHA_SLOW
         )
 
-        # Gestion des variations "habillé + PC portable vs nu" :
-        # Une fois les premières mesures effectuées (count >= 3), si le poids mesuré est
-        # supérieur de plus de 1.5 kg au poids appris habituel, il est très probable que
-        # la personne ait des vêtements lourds ou un objet (PC, livre). On réduit fortement
-        # l'impact sur le poids de base pour ne pas décaler son poids corporel de référence.
+        # Si le poids mesuré dépasse de plus de 1.5 kg le poids appris habituel (count >= 3),
+        # on réduit l'impact pour ne pas intégrer le poids d'un PC ou de vêtements lourds.
         if count >= 3 and diff > 1.5:
             alpha *= 0.25
 
         new_w = current_w + alpha * diff
-        # Bornage dans l'intervalle autorisé autour du poids initial
         new_w = max(init_w - max_drift, min(init_w + max_drift, new_w))
 
         new_dev = (
@@ -545,6 +751,7 @@ class LitOccupancyHub:
         self._learning_samples.clear()
         self.current_present = set()
         self.last_confident = True
+        self._baseline_verified = True
         if self.last_raw is not None:
             self.async_recalibrate(self.last_raw)
             self.last_stable_raw = self.last_raw
@@ -563,20 +770,10 @@ class LitOccupancyHub:
         self._notify_listeners()
 
     def _best_match(self, raw: float) -> tuple[set[str], bool]:
-        """Trouve la combinaison de personnes la plus proche du delta observé.
-
-        Gère :
-        - Les deltas négatifs (ex: -80 kg quand le capteur a démarré avec quelqu'un
-          dans le lit puis que la personne est sortie) -> détecté comme lit vide
-          avec confiance pour déclencher l'auto-recalibration sur ce nouveau plancher.
-        - Les variations positives liées aux vêtements ou accessoires (PC portable, etc.).
-        """
+        """Trouve la combinaison de personnes la plus proche du delta observé."""
         delta = raw - self.baseline
 
-        # Si le poids descend nettement sous la baseline (ex: -80 kg après un boot
-        # capteur lit occupé), le lit s'est allégé sous sa référence actuelle :
-        # c'est un état "lit vide" qui doit recalibrer la baseline vers le bas.
-        if delta < -DEFAULT_EMPTY_TOLERANCE:
+        if delta <= DEFAULT_EMPTY_TOLERANCE:
             return set(), True
 
         best_combo: frozenset[str] = frozenset()
@@ -588,12 +785,11 @@ class LitOccupancyHub:
                 distance = abs(delta)
                 tol = DEFAULT_EMPTY_TOLERANCE
             else:
-                # Tolérance asymétrique : on pardonne un léger excédent positif
-                # (vêtements, ordinateur portable, livre) jusqu'à LEARNING_ACCESSORY_OFFSET_KG
-                # par personne présente.
                 accessory_allowance = LEARNING_ACCESSORY_OFFSET_KG * len(combo)
                 if delta >= expected:
-                    effective_diff = max(0.0, (delta - expected) - accessory_allowance * 0.5)
+                    effective_diff = max(
+                        0.0, (delta - expected) - accessory_allowance * 0.5
+                    )
                 else:
                     effective_diff = expected - delta
                 distance = effective_diff
