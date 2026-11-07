@@ -10,7 +10,7 @@ lors d'un redémarrage alors que le lit est occupé) en une détection fiable de
 """
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 import itertools
 import logging
 from typing import Any
@@ -48,6 +48,9 @@ from .const import (
     LEARNING_SETTLE_SECONDS,
     MIN_SIGNIFICANT_STEP_KG,
     MULTI_PERSON_COUPLING,
+    NIGHT_INTERRUPTION_MAX_SECONDS,
+    NIGHT_MIN_DURATION_SECONDS,
+    PERIODIC_UPDATE_INTERVAL_SECONDS,
     STEP_MOTION_THRESHOLD_KG,
     STORAGE_KEY_PREFIX,
     STORAGE_SCHEMA_VERSION,
@@ -148,6 +151,7 @@ class LitOccupancyHub:
         self._pending_present: set[str] | None = None
         self._learning_samples: list[float] = []
         self._listeners: list[Any] = []
+        self._time_listeners: list[Any] = []
         self._last_storage_save: float = dt_util.now().timestamp()
 
         self._store = Store[dict[str, Any]](
@@ -187,30 +191,49 @@ class LitOccupancyHub:
         return float(stats["learned_weight"])
 
     def _make_default_daily_stats(self) -> dict[str, Any]:
-        """Génère la structure par défaut des compteurs journaliers pour une personne."""
-        today_str = dt_util.now().date().isoformat()
+        """Génère la structure par défaut des compteurs journaliers et session de nuit pour une personne."""
+        local_now = dt_util.as_local(dt_util.now())
+        today_str = local_now.date().isoformat()
         return {
             "date": today_str,
             "in_bed_seconds": 0.0,
             "out_of_bed_seconds": 0.0,
-            "last_update": dt_util.now().timestamp(),
+            "last_update": local_now.timestamp(),
             "last_in_bed": None,
             "last_out_bed": None,
             "yesterday_in_bed_seconds": 0.0,
             "yesterday_out_bed_seconds": 0.0,
+            # Métriques de session de sommeil / nuit (indépendantes du reset de minuit)
+            "sleep_session_active": False,
+            "sleep_start_ts": None,
+            "sleep_start_iso": None,
+            "sleep_wake_ts": None,
+            "sleep_wake_iso": None,
+            "sleep_duration_seconds": 0.0,
+            "sleep_interruptions": 0,
+            "sleep_interruption_seconds": 0.0,
+            "pending_exit_ts": None,
+            "continuous_out_of_bed_start_ts": None,
+            "last_night_bed_iso": None,
+            "last_night_wake_iso": None,
+            "last_nap_seconds": 0.0,
+            "last_nap_start_iso": None,
+            "last_nap_end_iso": None,
         }
 
-    def _update_time_trackers(self, now: Any | None = None) -> bool:
-        """Met à jour les compteurs journaliers pour chaque personne.
+    def _update_time_trackers(self, now: Any | None = None) -> tuple[bool, bool]:
+        """Met à jour les compteurs journaliers et les sessions de sommeil pour chaque personne.
 
-        Prend en compte le passage à minuit (rollover) pour archiver la veille
+        Prend en compte le passage à minuit en heure locale (rollover) pour archiver la veille
         et réinitialiser le compteur du nouveau jour.
-        Retourne True si des compteurs ont été modifiés.
+        Valide également la clôture d'une nuit de sommeil après un lever continu > 15 min.
+        Retourne (changed, day_rollover).
         """
-        current_dt = now if now is not None else dt_util.now()
+        current_dt = dt_util.as_local(now if now is not None else dt_util.now())
         current_ts = current_dt.timestamp()
         current_date_str = current_dt.date().isoformat()
         changed = False
+        day_rollover = False
 
         for p in self.persons:
             name = p[CONF_NAME]
@@ -221,11 +244,51 @@ class LitOccupancyHub:
             elapsed = max(0.0, current_ts - last_ts)
             stats["last_update"] = current_ts
 
+            is_in_bed = name in self.current_present
+
+            # 1. Clôture de la session de sommeil après un lever définitif (> 15 minutes)
+            pending_exit = stats.get("pending_exit_ts")
+            if pending_exit is not None and not is_in_bed:
+                if (current_ts - pending_exit) >= NIGHT_INTERRUPTION_MAX_SECONDS:
+                    wake_dt = dt_util.as_local(
+                        datetime.fromtimestamp(pending_exit, tz=timezone.utc)
+                    )
+                    stats["sleep_wake_ts"] = pending_exit
+                    stats["sleep_wake_iso"] = wake_dt.isoformat()
+
+                    sleep_start = stats.get("sleep_start_ts")
+                    if sleep_start is not None:
+                        interr_sec = float(stats.get("sleep_interruption_seconds", 0.0))
+                        raw_duration = max(0.0, pending_exit - sleep_start - interr_sec)
+
+                        if raw_duration >= NIGHT_MIN_DURATION_SECONDS:
+                            start_dt = dt_util.as_local(
+                                datetime.fromtimestamp(sleep_start, tz=timezone.utc)
+                            )
+                            # Une nuit commence le soir/nuit (>= 19h ou < 7h) OU dure au moins 3h
+                            is_night_session = (
+                                start_dt.hour >= 19
+                                or start_dt.hour < 7
+                                or raw_duration >= 10800.0
+                            )
+                            if is_night_session:
+                                stats["sleep_duration_seconds"] = round(raw_duration, 1)
+                                stats["last_night_bed_iso"] = stats.get("sleep_start_iso")
+                                stats["last_night_wake_iso"] = stats["sleep_wake_iso"]
+                            else:
+                                stats["last_nap_seconds"] = round(raw_duration, 1)
+                                stats["last_nap_start_iso"] = stats.get("sleep_start_iso")
+                                stats["last_nap_end_iso"] = stats["sleep_wake_iso"]
+
+                    stats["sleep_session_active"] = False
+                    stats["pending_exit_ts"] = None
+                    stats["continuous_out_of_bed_start_ts"] = pending_exit
+                    changed = True
+
             if elapsed <= 0.0:
                 continue
 
             changed = True
-            is_in_bed = name in self.current_present
             saved_date = stats.get("date", current_date_str)
 
             if saved_date == current_date_str:
@@ -236,7 +299,8 @@ class LitOccupancyHub:
                         stats.get("out_of_bed_seconds", 0.0) + elapsed
                     )
             else:
-                # Minuit a été franchi entre last_ts et current_ts
+                day_rollover = True
+                # Minuit en HEURE LOCALE a été franchi entre last_ts et current_ts
                 midnight_today = current_dt.replace(
                     hour=0, minute=0, second=0, microsecond=0
                 )
@@ -268,13 +332,14 @@ class LitOccupancyHub:
 
                 stats["date"] = current_date_str
 
-        return changed
+        return changed, day_rollover
 
     @callback
     def _async_periodic_tracker_update(self, now: Any) -> None:
-        """Appelé périodiquement toutes les 30 secondes pour rafraîchir les capteurs de temps."""
-        if self._update_time_trackers(now):
-            self._notify_listeners()
+        """Appelé périodiquement toutes les 60 secondes pour rafraîchir les capteurs de temps."""
+        changed, day_rollover = self._update_time_trackers(now)
+        if changed:
+            self._notify_time_listeners(force=day_rollover)
             current_ts = dt_util.now().timestamp()
             if current_ts - self._last_storage_save > 900:  # 15 minutes
                 self._last_storage_save = current_ts
@@ -322,11 +387,12 @@ class LitOccupancyHub:
                         stats["sample_count"] = int(s.get("sample_count", 0))
                         stats["avg_deviation"] = float(s.get("avg_deviation", 0.0))
 
-        # Restauration des compteurs journaliers
+        # Restauration des compteurs journaliers et sessions de sommeil
         stored_daily = stored.get("person_daily_stats", {})
         if isinstance(stored_daily, dict):
-            today_str = dt_util.now().date().isoformat()
-            yesterday_str = (dt_util.now().date() - timedelta(days=1)).isoformat()
+            local_now = dt_util.as_local(dt_util.now())
+            today_str = local_now.date().isoformat()
+            yesterday_str = (local_now.date() - timedelta(days=1)).isoformat()
             for name, stats in self.person_daily_stats.items():
                 if name in stored_daily and isinstance(stored_daily[name], dict):
                     sd = stored_daily[name]
@@ -342,8 +408,6 @@ class LitOccupancyHub:
                         stats["yesterday_out_bed_seconds"] = float(
                             sd.get("yesterday_out_bed_seconds", 0.0)
                         )
-                        stats["last_in_bed"] = sd.get("last_in_bed")
-                        stats["last_out_bed"] = sd.get("last_out_bed")
                     elif saved_date == yesterday_str:
                         stats["yesterday_in_bed_seconds"] = float(
                             sd.get("in_bed_seconds", 0.0)
@@ -351,8 +415,29 @@ class LitOccupancyHub:
                         stats["yesterday_out_bed_seconds"] = float(
                             sd.get("out_of_bed_seconds", 0.0)
                         )
-                        stats["last_in_bed"] = sd.get("last_in_bed")
-                        stats["last_out_bed"] = sd.get("last_out_bed")
+
+                    # Restauration de l'historique de session et des horodatages
+                    for key in (
+                        "last_in_bed",
+                        "last_out_bed",
+                        "sleep_session_active",
+                        "sleep_start_ts",
+                        "sleep_start_iso",
+                        "sleep_wake_ts",
+                        "sleep_wake_iso",
+                        "sleep_duration_seconds",
+                        "sleep_interruptions",
+                        "sleep_interruption_seconds",
+                        "pending_exit_ts",
+                        "continuous_out_of_bed_start_ts",
+                        "last_night_bed_iso",
+                        "last_night_wake_iso",
+                        "last_nap_seconds",
+                        "last_nap_start_iso",
+                        "last_nap_end_iso",
+                    ):
+                        if key in sd and sd[key] is not None:
+                            stats[key] = sd[key]
 
         self._rebuild_combinations()
 
@@ -378,12 +463,24 @@ class LitOccupancyHub:
         self.hass.async_create_task(self.async_save_storage())
 
     def async_add_listener(self, callback_fn: Any) -> None:
-        """Permet aux entités de s'abonner aux mises à jour."""
+        """Permet aux entités (poids, présence) de s'abonner aux changements d'état."""
         self._listeners.append(callback_fn)
 
-    def _notify_listeners(self) -> None:
+    def async_add_time_listener(self, callback_fn: Any) -> None:
+        """Permet aux entités temporelles (durées, sommeil) de s'abonner aux mises à jour."""
+        self._time_listeners.append(callback_fn)
+
+    def _notify_listeners(self, force_time: bool = False) -> None:
+        """Notifie toutes les entités de l'intégration."""
         for listener in self._listeners:
             listener()
+        for listener in self._time_listeners:
+            listener(force_time)
+
+    def _notify_time_listeners(self, force: bool = False) -> None:
+        """Notifie uniquement les entités de temps et sommeil (sans réécrire les capteurs de poids)."""
+        for listener in self._time_listeners:
+            listener(force)
 
     @callback
     def async_start(self) -> None:
@@ -391,7 +488,9 @@ class LitOccupancyHub:
             self.hass, [self.source_sensor], self._async_source_changed
         )
         self._unsub_interval = async_track_time_interval(
-            self.hass, self._async_periodic_tracker_update, timedelta(seconds=30)
+            self.hass,
+            self._async_periodic_tracker_update,
+            timedelta(seconds=PERIODIC_UPDATE_INTERVAL_SECONDS),
         )
         state = self.hass.states.get(self.source_sensor)
         if state is not None:
@@ -586,12 +685,51 @@ class LitOccupancyHub:
         self._pending_present = None
 
         # Enregistre l'horodatage de la dernière entrée ou sortie pour chaque personne
-        now_iso = dt_util.now().isoformat()
+        local_now = dt_util.as_local(dt_util.now())
+        now_iso = local_now.isoformat()
+        current_ts = local_now.timestamp()
+
         for name in self.person_daily_stats:
-            if name in self.current_present and name not in previous_present:
-                self.person_daily_stats[name]["last_in_bed"] = now_iso
-            elif name not in self.current_present and name in previous_present:
-                self.person_daily_stats[name]["last_out_bed"] = now_iso
+            stats = self.person_daily_stats[name]
+            entered = name in self.current_present and name not in previous_present
+            exited = name not in self.current_present and name in previous_present
+
+            if entered:
+                stats["last_in_bed"] = now_iso
+                stats["continuous_out_of_bed_start_ts"] = None
+
+                pending_exit = stats.get("pending_exit_ts")
+                if (
+                    stats.get("sleep_session_active")
+                    and pending_exit is not None
+                    and (current_ts - pending_exit) <= NIGHT_INTERRUPTION_MAX_SECONDS
+                ):
+                    # Retour au lit après un lever bref nocturne (toilettes, verre d'eau...)
+                    interr_duration = current_ts - pending_exit
+                    stats["sleep_interruptions"] = (
+                        int(stats.get("sleep_interruptions", 0)) + 1
+                    )
+                    stats["sleep_interruption_seconds"] = (
+                        float(stats.get("sleep_interruption_seconds", 0.0))
+                        + interr_duration
+                    )
+                    stats["pending_exit_ts"] = None
+                else:
+                    # Nouvelle session au lit
+                    stats["pending_exit_ts"] = None
+                    stats["sleep_session_active"] = True
+                    stats["sleep_start_ts"] = current_ts
+                    stats["sleep_start_iso"] = now_iso
+                    stats["sleep_wake_ts"] = None
+                    stats["sleep_wake_iso"] = None
+                    stats["sleep_interruptions"] = 0
+                    stats["sleep_interruption_seconds"] = 0.0
+
+            elif exited:
+                stats["last_out_bed"] = now_iso
+                stats["continuous_out_of_bed_start_ts"] = current_ts
+                if stats.get("sleep_session_active"):
+                    stats["pending_exit_ts"] = current_ts
 
         if self._unsub_learn_timer:
             self._unsub_learn_timer()
@@ -665,7 +803,7 @@ class LitOccupancyHub:
                 )
 
         self._schedule_save()
-        self._notify_listeners()
+        self._notify_listeners(force_time=True)
 
     def _expected_combo_weight(self, combo: set[str] | frozenset[str]) -> float:
         """Calcule le poids attendu d'un ensemble de personnes (avec couplage si >= 2)."""
@@ -914,7 +1052,7 @@ class LitOccupancyHub:
             self.async_recalibrate(self.last_raw)
             self.last_stable_raw = self.last_raw
         self._schedule_save()
-        self._notify_listeners()
+        self._notify_listeners(force_time=True)
 
     @callback
     def async_reset_learned_weights(self) -> None:
@@ -925,7 +1063,7 @@ class LitOccupancyHub:
             stats["avg_deviation"] = 0.0
         self._rebuild_combinations()
         self._schedule_save()
-        self._notify_listeners()
+        self._notify_listeners(force_time=True)
 
     def _best_match(self, raw: float) -> tuple[set[str], bool]:
         """Trouve la combinaison de personnes la plus proche du delta observé."""

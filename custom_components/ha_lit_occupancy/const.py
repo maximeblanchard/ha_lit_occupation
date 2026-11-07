@@ -35,5 +35,10 @@ LEARNING_FAST_SAMPLES = 10  # nombre d'échantillons avant de passer en apprenti
 LEARNING_ACCESSORY_OFFSET_KG = 3.5  # marge haute (habillé, PC portable, livre...)
 LEARNING_MAX_DRIFT_RATIO = 0.25  # écart max (25%) autorisé entre poids initial et poids appris
 
+# Suivi temporel et analyse des nuits de sommeil
+NIGHT_INTERRUPTION_MAX_SECONDS = 900.0  # 15 minutes max pour tolérer une micro-sortie nocturne (verre d'eau, toilettes)
+NIGHT_MIN_DURATION_SECONDS = 1800.0  # 30 minutes minimum pour qualifier une session
+PERIODIC_UPDATE_INTERVAL_SECONDS = 60  # rafraîchissement périodique des compteurs temporels (60s)
+
 MIN_PERSONS = 1
 MAX_PERSONS = 6

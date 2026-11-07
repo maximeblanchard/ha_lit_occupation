@@ -43,15 +43,26 @@ Les capteurs numériques alimentent les statistiques à long terme de Home Assis
 |---|---|
 | `sensor.poids_estime_sur_le_lit` | **Vrai poids estimé sur le lit** ($\ge 0\text{ kg}$), corrigé de la baseline et insensible aux reboots/tares à `0 kg` de l'ESP |
 | `sensor.poids_appris_<nom>` | **Poids appris actuel** de chaque occupant (kg), mis à jour au fil des nuits |
-| `sensor.temps_au_lit_<nom>` | **Temps cumulé au lit aujourd'hui** (heures), avec affichage formaté `Xh Ymin`, reset auto à minuit et conservation du temps de la veille |
-| `sensor.temps_hors_du_lit_<nom>` | **Temps cumulé hors du lit aujourd'hui** (heures), avec affichage formaté `Xh Ymin`, reset auto à minuit et conservation du temps de la veille |
+| `sensor.derniere_nuit_<nom>` | **Durée de la dernière nuit complète** (ou en cours) de sommeil (heures), sans coupure à minuit, avec tolérance aux micro-sorties nocturnes |
+| `sensor.temps_au_lit_<nom>` | **Temps cumulé au lit aujourd'hui** (heures), avec affichage formaté `Xh Ymin`, reset auto à minuit heure locale et conservation de la veille |
+| `sensor.temps_hors_du_lit_<nom>` | **Temps cumulé hors du lit aujourd'hui** (heures), avec durée continue depuis le dernier lever et conservation de la veille |
 
-Chaque capteur de temps expose en attributs :
-- `temps_formate` : durée lisible aujourd'hui (ex. `7h 45min`)
-- `total_secondes`, `total_minutes`, `total_heures`
-- `temps_hier_formate` : durée enregistrée hier
-- `au_lit_actuellement` : booléen (`true` / `false`)
-- `derniere_entree_lit` / `derniere_sortie_lit` : horodatage de la dernière transition
+#### Attributs riches disponibles :
+- **`sensor.derniere_nuit_<nom>`** :
+  - `temps_formate` : durée lisible de la nuit (ex. `7h 45min`)
+  - `heure_coucher` / `heure_lever` : horodatages ISO locaux précis
+  - `en_cours` : `true` pendant la nuit, `false` après le lever
+  - `interruptions` : nombre de sorties brèves nocturnes (< 15 min, ex. toilettes ou verre d'eau)
+  - `temps_interruptions` : temps passé hors du lit pendant la nuit
+  - `derniere_sieste_formatee` : durée d'une éventuelle sieste en journée sans écraser la nuit
+- **`sensor.temps_hors_du_lit_<nom>`** :
+  - `temps_depuis_lever_formate` : temps écoulé en continu depuis le dernier lever (ex. `8h 15min`)
+  - `duree_continue_hors_du_lit_heures` : durée en heures décimales
+  - `temps_hier_formate` : durée enregistrée hier
+- **`sensor.temps_au_lit_<nom>`** :
+  - `coucher_derniere_nuit` / `lever_derniere_nuit` / `duree_derniere_nuit`
+  - `derniere_entree_lit` / `derniere_sortie_lit`
+  - `temps_hier_formate` : durée enregistrée hier
 
 ### Boutons d'action (`button`)
 
