@@ -43,9 +43,9 @@ Les capteurs numériques alimentent les statistiques à long terme de Home Assis
 |---|---|
 | `sensor.poids_estime_sur_le_lit` | **Vrai poids estimé sur le lit** ($\ge 0\text{ kg}$), corrigé de la baseline et insensible aux reboots/tares à `0 kg` de l'ESP |
 | `sensor.poids_appris_<nom>` | **Poids appris actuel** de chaque occupant (kg), mis à jour au fil des nuits |
-| `sensor.derniere_nuit_<nom>` | **Durée de la dernière nuit complète** (ou en cours) de sommeil (heures), sans coupure à minuit, avec tolérance aux micro-sorties nocturnes |
-| `sensor.temps_au_lit_<nom>` | **Temps cumulé au lit aujourd'hui** (heures), avec affichage formaté `Xh Ymin`, reset auto à minuit heure locale et conservation de la veille |
-| `sensor.temps_hors_du_lit_<nom>` | **Temps cumulé hors du lit aujourd'hui** (heures), avec durée continue depuis le dernier lever et conservation de la veille |
+| `sensor.derniere_nuit_<nom>` | **Durée de la dernière nuit complète** (ou en cours) de sommeil, sans coupure à minuit, avec tolérance aux micro-sorties nocturnes |
+| `sensor.temps_au_lit_<nom>` | **Temps cumulé au lit aujourd'hui** (en minutes et format lisible `Xh Ymin`), reset auto à minuit heure locale et conservation de la veille |
+| `sensor.temps_hors_du_lit_<nom>` | **Temps cumulé hors du lit aujourd'hui** (en minutes et format lisible `Xh Ymin`), avec durée continue depuis le dernier lever et conservation de la veille |
 
 #### Attributs riches disponibles :
 - **`sensor.derniere_nuit_<nom>`** :

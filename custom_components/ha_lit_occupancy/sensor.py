@@ -150,14 +150,14 @@ class _LitBaseTimeSensor(SensorEntity):
 
     _attr_should_poll = False
     _attr_device_class = SensorDeviceClass.DURATION
-    _attr_native_unit_of_measurement = UnitOfTime.HOURS
-    _attr_suggested_display_precision = 1
+    _attr_native_unit_of_measurement = UnitOfTime.MINUTES
+    _attr_suggested_display_precision = 0
 
     def __init__(self, hub: LitOccupancyHub, entry: ConfigEntry, name: str) -> None:
         self._hub = hub
         self._entry = entry
         self._person_name = name
-        self._last_written_rounded: float | None = None
+        self._last_written_rounded: int | None = None
         self._last_written_ts: float = 0.0
         self._last_written_in_bed: bool | None = None
 
@@ -169,20 +169,19 @@ class _LitBaseTimeSensor(SensorEntity):
         now_ts = dt_util.now().timestamp()
         is_in_bed = self._person_name in self._hub.current_present
         val = self.native_value
-        rounded_val = round(val, 1) if val is not None else None
 
         # On écrit l'état si :
         # 1. Mise à jour forcée (ex: transition de présence, rollover minuit, fin de nuit)
         # 2. Changement du statut de présence au lit
-        # 3. La valeur affichée à l'arrondi (0.1h = ~6 min) a bougé
+        # 3. La valeur en minutes a changé (au maximum 1 fois par minute)
         # 4. Au moins 5 minutes se sont écoulées en régime stable
         if (
             force
             or is_in_bed != self._last_written_in_bed
-            or rounded_val != self._last_written_rounded
+            or val != self._last_written_rounded
             or (now_ts - self._last_written_ts) >= 300.0
         ):
-            self._last_written_rounded = rounded_val
+            self._last_written_rounded = val
             self._last_written_in_bed = is_in_bed
             self._last_written_ts = now_ts
             self.async_write_ha_state()
@@ -209,7 +208,7 @@ class LitPersonLastNightSleepSensor(_LitBaseTimeSensor):
         self._attr_unique_id = f"{entry.entry_id}_{name}_last_night_sleep"
 
     @property
-    def native_value(self) -> float:
+    def native_value(self) -> int:
         stats = self._hub.person_daily_stats.get(self._person_name, {})
         is_in_bed = self._person_name in self._hub.current_present
         is_active = stats.get("sleep_session_active", False)
@@ -221,11 +220,11 @@ class LitPersonLastNightSleepSensor(_LitBaseTimeSensor):
                 current_ts = dt_util.now().timestamp()
                 interr = float(stats.get("sleep_interruption_seconds", 0.0))
                 elapsed = max(0.0, current_ts - start_ts - interr)
-                return round(elapsed / 3600.0, 2)
+                return int(round(elapsed / 60.0))
 
         # Sinon, retourne la durée de la dernière nuit complète validée
         sec = float(stats.get("sleep_duration_seconds", 0.0))
-        return round(sec / 3600.0, 2)
+        return int(round(sec / 60.0))
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
@@ -251,7 +250,7 @@ class LitPersonLastNightSleepSensor(_LitBaseTimeSensor):
         attrs: dict[str, Any] = {
             "temps_formate": _format_duration(sec),
             "total_secondes": int(round(sec)),
-            "total_minutes": round(sec / 60.0, 1),
+            "total_minutes": int(round(sec / 60.0)),
             "total_heures": round(sec / 3600.0, 2),
             "heure_coucher": bed_time,
             "heure_lever": wake_time,
@@ -279,12 +278,12 @@ class LitPersonInBedTimeSensor(_LitBaseTimeSensor):
         self._attr_unique_id = f"{entry.entry_id}_{name}_time_in_bed"
 
     @property
-    def native_value(self) -> float:
+    def native_value(self) -> int:
         stats = self._hub.person_daily_stats.get(self._person_name)
         if not stats:
-            return 0.0
+            return 0
         sec = float(stats.get("in_bed_seconds", 0.0))
-        return round(sec / 3600.0, 2)
+        return int(round(sec / 60.0))
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
@@ -296,7 +295,7 @@ class LitPersonInBedTimeSensor(_LitBaseTimeSensor):
         return {
             "temps_formate": _format_duration(sec),
             "total_secondes": int(round(sec)),
-            "total_minutes": round(sec / 60.0, 1),
+            "total_minutes": int(round(sec / 60.0)),
             "total_heures": round(sec / 3600.0, 2),
             "temps_hier_formate": _format_duration(yesterday_sec),
             "secondes_hier": int(round(yesterday_sec)),
@@ -326,12 +325,12 @@ class LitPersonOutOfBedTimeSensor(_LitBaseTimeSensor):
         self._attr_unique_id = f"{entry.entry_id}_{name}_time_out_of_bed"
 
     @property
-    def native_value(self) -> float:
+    def native_value(self) -> int:
         stats = self._hub.person_daily_stats.get(self._person_name)
         if not stats:
-            return 0.0
+            return 0
         sec = float(stats.get("out_of_bed_seconds", 0.0))
-        return round(sec / 3600.0, 2)
+        return int(round(sec / 60.0))
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
@@ -360,11 +359,14 @@ class LitPersonOutOfBedTimeSensor(_LitBaseTimeSensor):
                 if not is_in_bed
                 else "Actuellement au lit"
             ),
+            "duree_continue_hors_du_lit_minutes": (
+                int(round(continuous_out_sec / 60.0)) if not is_in_bed else 0
+            ),
             "duree_continue_hors_du_lit_heures": (
                 round(continuous_out_sec / 3600.0, 2) if not is_in_bed else 0.0
             ),
             "total_secondes": int(round(sec)),
-            "total_minutes": round(sec / 60.0, 1),
+            "total_minutes": int(round(sec / 60.0)),
             "total_heures": round(sec / 3600.0, 2),
             "temps_hier_formate": _format_duration(yesterday_sec),
             "secondes_hier": int(round(yesterday_sec)),
