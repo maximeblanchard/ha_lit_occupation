@@ -309,10 +309,15 @@ class LitOccupancyHub:
                 elapsed_yesterday = max(0.0, min(elapsed, midnight_ts - last_ts))
                 elapsed_today = max(0.0, current_ts - max(last_ts, midnight_ts))
 
-                if is_in_bed or stats.get("sleep_session_active"):
-                    # La personne est au lit en train de dormir : on ne remet JAMAIS son temps au lit à zéro à minuit !
-                    # Sa nuit a commencé avant minuit et continue sur la nouvelle journée.
-                    stats["in_bed_seconds"] = stats.get("in_bed_seconds", 0.0) + elapsed
+                if is_in_bed:
+                    yesterday_total = (
+                        stats.get("in_bed_seconds", 0.0) + elapsed_yesterday
+                    )
+                    stats["yesterday_in_bed_seconds"] = round(yesterday_total, 1)
+                    stats["yesterday_out_bed_seconds"] = round(
+                        stats.get("out_of_bed_seconds", 0.0), 1
+                    )
+                    stats["in_bed_seconds"] = elapsed_today
                     stats["out_of_bed_seconds"] = 0.0
                 else:
                     yesterday_total = (
@@ -336,7 +341,7 @@ class LitOccupancyHub:
         if changed:
             self._notify_time_listeners(force=day_rollover)
             current_ts = dt_util.now().timestamp()
-            if current_ts - self._last_storage_save > 900:  # 15 minutes
+            if day_rollover or (current_ts - self._last_storage_save > 900):
                 self._last_storage_save = current_ts
                 self._schedule_save()
 
@@ -426,57 +431,54 @@ class LitOccupancyHub:
                     out_bed_sec = float(sd.get("out_of_bed_seconds", 0.0))
                     yest_in_sec = float(sd.get("yesterday_in_bed_seconds", 0.0))
                     yest_out_sec = float(sd.get("yesterday_out_bed_seconds", 0.0))
+                    last_saved_ts = float(sd.get("last_update", current_ts))
 
-                    # Correction auto si sleep_start_ts avait été tronqué après minuit (ex: reboot à 00h12)
-                    # alors que la personne avait commencé sa nuit hier soir avant minuit :
-                    if (
-                        stats.get("sleep_session_active")
-                        and stats.get("sleep_start_ts") is not None
-                        and yest_in_sec > 0
-                        and float(stats["sleep_start_ts"]) >= midnight_ts
-                    ):
-                        stats["sleep_start_ts"] = (
-                            float(stats["sleep_start_ts"]) - yest_in_sec
-                        )
-                        start_dt = dt_util.as_local(
-                            datetime.fromtimestamp(
-                                stats["sleep_start_ts"], tz=timezone.utc
-                            )
-                        )
-                        stats["sleep_start_iso"] = start_dt.isoformat()
-                        in_bed_sec = max(
-                            in_bed_sec, current_ts - stats["sleep_start_ts"]
-                        )
+                    is_sleeping = bool(stats.get("sleep_session_active"))
+                    was_in_bed = is_sleeping and stats.get("pending_exit_ts") is None
 
                     if saved_date == today_str:
+                        # Si le stockage date d'aujourd'hui :
+                        # On comble le temps éventuel passé pendant l'arrêt/redémarrage de Home Assistant
+                        elapsed_down = max(0.0, current_ts - last_saved_ts)
+                        if was_in_bed:
+                            # Si la personne dormait avant minuit et dort toujours aujourd'hui :
+                            # Le temps passé au lit aujourd'hui (depuis 00h00) ne peut pas être inférieur au temps écoulé depuis minuit !
+                            sleep_start = float(stats.get("sleep_start_ts") or current_ts)
+                            interr = float(stats.get("sleep_interruption_seconds", 0.0))
+                            if sleep_start < midnight_ts:
+                                elapsed_since_midnight = max(0.0, current_ts - midnight_ts - interr)
+                                in_bed_sec = max(in_bed_sec + elapsed_down, elapsed_since_midnight)
+                            else:
+                                in_bed_sec += elapsed_down
+                            out_bed_sec = 0.0
+                        else:
+                            out_bed_sec += elapsed_down
+
                         stats["in_bed_seconds"] = in_bed_sec
                         stats["out_of_bed_seconds"] = out_bed_sec
                         stats["yesterday_in_bed_seconds"] = yest_in_sec
                         stats["yesterday_out_bed_seconds"] = yest_out_sec
+
                     elif saved_date == yesterday_str:
-                        stats["yesterday_in_bed_seconds"] = (
-                            yest_in_sec if yest_in_sec > 0 else in_bed_sec
-                        )
-                        stats["yesterday_out_bed_seconds"] = out_bed_sec
-                        if (
-                            stats.get("sleep_session_active")
-                            and stats.get("sleep_start_ts")
-                        ):
-                            interr = float(
-                                stats.get("sleep_interruption_seconds", 0.0)
-                            )
-                            stats["in_bed_seconds"] = max(
-                                in_bed_sec,
-                                current_ts
-                                - float(stats["sleep_start_ts"])
-                                - interr,
-                            )
+                        # Si le stockage datait d'hier avant minuit :
+                        # Minuit a été franchi pendant le redémarrage ou avant la sauvegarde !
+                        elapsed_to_midnight = max(0.0, midnight_ts - last_saved_ts)
+                        elapsed_today = max(0.0, current_ts - midnight_ts)
+
+                        if was_in_bed:
+                            stats["yesterday_in_bed_seconds"] = in_bed_sec + elapsed_to_midnight
+                            stats["yesterday_out_bed_seconds"] = out_bed_sec
+                            # Pour aujourd'hui (depuis 00h00) : tout le temps écoulé depuis minuit a été passé au lit
+                            stats["in_bed_seconds"] = elapsed_today
                             stats["out_of_bed_seconds"] = 0.0
                         else:
+                            stats["yesterday_out_bed_seconds"] = out_bed_sec + elapsed_to_midnight
+                            stats["yesterday_in_bed_seconds"] = in_bed_sec
                             stats["in_bed_seconds"] = 0.0
-                            stats["out_of_bed_seconds"] = max(
-                                0.0, current_ts - midnight_ts
-                            )
+                            stats["out_of_bed_seconds"] = elapsed_today
+
+                    stats["date"] = today_str
+                    stats["last_update"] = current_ts
 
         self._rebuild_combinations()
 
@@ -770,19 +772,6 @@ class LitOccupancyHub:
                     stats["sleep_wake_iso"] = None
                     stats["sleep_interruptions"] = 0
                     stats["sleep_interruption_seconds"] = 0.0
-
-                    # Si c'est un nouveau coucher en soirée (>= 19h ou < 7h) :
-                    # On archive la nuit précédente dans yesterday_in_bed_seconds
-                    # et on démarre le compteur au lit pour cette nouvelle nuit
-                    if (
-                        local_now.hour >= 19 or local_now.hour < 7
-                    ) and stats.get("in_bed_seconds", 0.0) > 0:
-                        stats["yesterday_in_bed_seconds"] = stats["in_bed_seconds"]
-                        stats["yesterday_out_bed_seconds"] = stats.get(
-                            "out_of_bed_seconds", 0.0
-                        )
-                        stats["in_bed_seconds"] = 0.0
-                        stats["out_of_bed_seconds"] = 0.0
 
             elif exited:
                 stats["last_out_bed"] = now_iso
