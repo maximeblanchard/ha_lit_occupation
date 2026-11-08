@@ -309,15 +309,10 @@ class LitOccupancyHub:
                 elapsed_yesterday = max(0.0, min(elapsed, midnight_ts - last_ts))
                 elapsed_today = max(0.0, current_ts - max(last_ts, midnight_ts))
 
-                if is_in_bed:
-                    yesterday_total = (
-                        stats.get("in_bed_seconds", 0.0) + elapsed_yesterday
-                    )
-                    stats["yesterday_in_bed_seconds"] = round(yesterday_total, 1)
-                    stats["yesterday_out_bed_seconds"] = round(
-                        stats.get("out_of_bed_seconds", 0.0), 1
-                    )
-                    stats["in_bed_seconds"] = elapsed_today
+                if is_in_bed or stats.get("sleep_session_active"):
+                    # La personne est au lit en train de dormir : on ne remet JAMAIS son temps au lit à zéro à minuit !
+                    # Sa nuit a commencé avant minuit et continue sur la nouvelle journée.
+                    stats["in_bed_seconds"] = stats.get("in_bed_seconds", 0.0) + elapsed
                     stats["out_of_bed_seconds"] = 0.0
                 else:
                     yesterday_total = (
@@ -391,32 +386,20 @@ class LitOccupancyHub:
         stored_daily = stored.get("person_daily_stats", {})
         if isinstance(stored_daily, dict):
             local_now = dt_util.as_local(dt_util.now())
+            current_ts = local_now.timestamp()
             today_str = local_now.date().isoformat()
             yesterday_str = (local_now.date() - timedelta(days=1)).isoformat()
+            midnight_today = local_now.replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+            midnight_ts = midnight_today.timestamp()
+
             for name, stats in self.person_daily_stats.items():
                 if name in stored_daily and isinstance(stored_daily[name], dict):
                     sd = stored_daily[name]
                     saved_date = sd.get("date")
-                    if saved_date == today_str:
-                        stats["in_bed_seconds"] = float(sd.get("in_bed_seconds", 0.0))
-                        stats["out_of_bed_seconds"] = float(
-                            sd.get("out_of_bed_seconds", 0.0)
-                        )
-                        stats["yesterday_in_bed_seconds"] = float(
-                            sd.get("yesterday_in_bed_seconds", 0.0)
-                        )
-                        stats["yesterday_out_bed_seconds"] = float(
-                            sd.get("yesterday_out_bed_seconds", 0.0)
-                        )
-                    elif saved_date == yesterday_str:
-                        stats["yesterday_in_bed_seconds"] = float(
-                            sd.get("in_bed_seconds", 0.0)
-                        )
-                        stats["yesterday_out_bed_seconds"] = float(
-                            sd.get("out_of_bed_seconds", 0.0)
-                        )
 
-                    # Restauration de l'historique de session et des horodatages
+                    # Restauration complète des attributs et timestamps d'abord
                     for key in (
                         "last_in_bed",
                         "last_out_bed",
@@ -438,6 +421,62 @@ class LitOccupancyHub:
                     ):
                         if key in sd and sd[key] is not None:
                             stats[key] = sd[key]
+
+                    in_bed_sec = float(sd.get("in_bed_seconds", 0.0))
+                    out_bed_sec = float(sd.get("out_of_bed_seconds", 0.0))
+                    yest_in_sec = float(sd.get("yesterday_in_bed_seconds", 0.0))
+                    yest_out_sec = float(sd.get("yesterday_out_bed_seconds", 0.0))
+
+                    # Correction auto si sleep_start_ts avait été tronqué après minuit (ex: reboot à 00h12)
+                    # alors que la personne avait commencé sa nuit hier soir avant minuit :
+                    if (
+                        stats.get("sleep_session_active")
+                        and stats.get("sleep_start_ts") is not None
+                        and yest_in_sec > 0
+                        and float(stats["sleep_start_ts"]) >= midnight_ts
+                    ):
+                        stats["sleep_start_ts"] = (
+                            float(stats["sleep_start_ts"]) - yest_in_sec
+                        )
+                        start_dt = dt_util.as_local(
+                            datetime.fromtimestamp(
+                                stats["sleep_start_ts"], tz=timezone.utc
+                            )
+                        )
+                        stats["sleep_start_iso"] = start_dt.isoformat()
+                        in_bed_sec = max(
+                            in_bed_sec, current_ts - stats["sleep_start_ts"]
+                        )
+
+                    if saved_date == today_str:
+                        stats["in_bed_seconds"] = in_bed_sec
+                        stats["out_of_bed_seconds"] = out_bed_sec
+                        stats["yesterday_in_bed_seconds"] = yest_in_sec
+                        stats["yesterday_out_bed_seconds"] = yest_out_sec
+                    elif saved_date == yesterday_str:
+                        stats["yesterday_in_bed_seconds"] = (
+                            yest_in_sec if yest_in_sec > 0 else in_bed_sec
+                        )
+                        stats["yesterday_out_bed_seconds"] = out_bed_sec
+                        if (
+                            stats.get("sleep_session_active")
+                            and stats.get("sleep_start_ts")
+                        ):
+                            interr = float(
+                                stats.get("sleep_interruption_seconds", 0.0)
+                            )
+                            stats["in_bed_seconds"] = max(
+                                in_bed_sec,
+                                current_ts
+                                - float(stats["sleep_start_ts"])
+                                - interr,
+                            )
+                            stats["out_of_bed_seconds"] = 0.0
+                        else:
+                            stats["in_bed_seconds"] = 0.0
+                            stats["out_of_bed_seconds"] = max(
+                                0.0, current_ts - midnight_ts
+                            )
 
         self._rebuild_combinations()
 
@@ -714,6 +753,13 @@ class LitOccupancyHub:
                         + interr_duration
                     )
                     stats["pending_exit_ts"] = None
+                elif (
+                    stats.get("sleep_session_active")
+                    and stats.get("sleep_start_ts") is not None
+                ):
+                    # Session déjà active (ex: redémarrage de Home Assistant, rechargement ou retour de détection)
+                    # On préserve absolument l'heure de coucher initiale !
+                    stats["pending_exit_ts"] = None
                 else:
                     # Nouvelle session au lit
                     stats["pending_exit_ts"] = None
@@ -724,6 +770,19 @@ class LitOccupancyHub:
                     stats["sleep_wake_iso"] = None
                     stats["sleep_interruptions"] = 0
                     stats["sleep_interruption_seconds"] = 0.0
+
+                    # Si c'est un nouveau coucher en soirée (>= 19h ou < 7h) :
+                    # On archive la nuit précédente dans yesterday_in_bed_seconds
+                    # et on démarre le compteur au lit pour cette nouvelle nuit
+                    if (
+                        local_now.hour >= 19 or local_now.hour < 7
+                    ) and stats.get("in_bed_seconds", 0.0) > 0:
+                        stats["yesterday_in_bed_seconds"] = stats["in_bed_seconds"]
+                        stats["yesterday_out_bed_seconds"] = stats.get(
+                            "out_of_bed_seconds", 0.0
+                        )
+                        stats["in_bed_seconds"] = 0.0
+                        stats["out_of_bed_seconds"] = 0.0
 
             elif exited:
                 stats["last_out_bed"] = now_iso

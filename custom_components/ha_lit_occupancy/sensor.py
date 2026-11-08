@@ -282,16 +282,33 @@ class LitPersonInBedTimeSensor(_LitBaseTimeSensor):
         stats = self._hub.person_daily_stats.get(self._person_name)
         if not stats:
             return 0
+        is_in_bed = self._person_name in self._hub.current_present
         sec = float(stats.get("in_bed_seconds", 0.0))
+
+        # Si la personne est actuellement au lit avec une session active :
+        # Le calcul dynamique depuis l'heure de coucher garantit une valeur
+        # rigoureusement exacte à la minute près, même à travers minuit ou après un redémarrage.
+        if is_in_bed and stats.get("sleep_start_ts"):
+            current_ts = dt_util.now().timestamp()
+            interr = float(stats.get("sleep_interruption_seconds", 0.0))
+            active_sec = max(0.0, current_ts - float(stats["sleep_start_ts"]) - interr)
+            sec = max(sec, active_sec)
+
         return int(round(sec / 60.0))
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         stats = self._hub.person_daily_stats.get(self._person_name, {})
         sec = float(stats.get("in_bed_seconds", 0.0))
+        is_in_bed = self._person_name in self._hub.current_present
+        if is_in_bed and stats.get("sleep_start_ts"):
+            current_ts = dt_util.now().timestamp()
+            interr = float(stats.get("sleep_interruption_seconds", 0.0))
+            active_sec = max(0.0, current_ts - float(stats["sleep_start_ts"]) - interr)
+            sec = max(sec, active_sec)
+
         yesterday_sec = float(stats.get("yesterday_in_bed_seconds", 0.0))
         night_sec = float(stats.get("sleep_duration_seconds", 0.0))
-        is_in_bed = self._person_name in self._hub.current_present
         return {
             "temps_formate": _format_duration(sec),
             "total_secondes": int(round(sec)),
