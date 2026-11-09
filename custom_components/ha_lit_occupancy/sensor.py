@@ -21,13 +21,11 @@ from .const import CONF_NAME, CONF_PERSONS, DOMAIN
 
 
 def _format_duration(seconds: float) -> str:
-    """Formate une durée en secondes sous forme lisible 'Xh Ymin' ou 'Ymin'."""
+    """Formate une durée en secondes sous forme lisible 'Xh Ymin'."""
     total_sec = max(0, int(round(seconds)))
     hours = total_sec // 3600
     minutes = (total_sec % 3600) // 60
-    if hours > 0:
-        return f"{hours}h {minutes:02d}min"
-    return f"{minutes}min"
+    return f"{hours}h {minutes:02d}min"
 
 
 async def async_setup_entry(
