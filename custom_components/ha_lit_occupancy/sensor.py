@@ -11,6 +11,7 @@ from homeassistant.components.sensor import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import UnitOfMass, UnitOfTime
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.util import dt as dt_util
@@ -151,7 +152,7 @@ class _LitBaseTimeSensor(SensorEntity):
     _attr_should_poll = False
     _attr_device_class = SensorDeviceClass.DURATION
     _attr_native_unit_of_measurement = UnitOfTime.MINUTES
-    _attr_suggested_display_precision = 0
+    _attr_suggested_display_precision = 2
 
     def __init__(self, hub: LitOccupancyHub, entry: ConfigEntry, name: str) -> None:
         self._hub = hub
@@ -163,6 +164,24 @@ class _LitBaseTimeSensor(SensorEntity):
 
     async def async_added_to_hass(self) -> None:
         self._hub.async_add_time_listener(self._handle_update)
+        # Élimination automatique de l'arrondi Home Assistant par tranche de 6 minutes (0.1h) :
+        # Si le registre d'entités a mémorisé l'unité en heures ('h') avec 1 décimale ou sans précision,
+        # on configure automatiquement la précision à 2 décimales (0.01h = 36s) pour afficher
+        # l'heure et la minute complète minute par minute sans saut de 6 min.
+        try:
+            ent_reg = er.async_get(self.hass)
+            entry = ent_reg.async_get(self.entity_id)
+            if entry:
+                sensor_opts = dict(entry.options.get("sensor", {}))
+                unit = sensor_opts.get("unit_of_measurement")
+                prec = sensor_opts.get("display_precision")
+                if unit == "h" or prec == 1 or prec is None:
+                    sensor_opts["display_precision"] = 2
+                    ent_reg.async_update_entity_options(
+                        self.entity_id, "sensor", sensor_opts
+                    )
+        except Exception:
+            pass
 
     def _handle_update(self, force: bool = False) -> None:
         """Met à jour l'état Home Assistant avec throttling pour éviter de saturer la base de données."""
