@@ -290,22 +290,31 @@ class LitOccupancyHub:
 
             changed = True
             saved_date = stats.get("date", current_date_str)
+            midnight_today = current_dt.replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+            midnight_ts = midnight_today.timestamp()
 
             if saved_date == current_date_str:
+                elapsed_today = max(0.0, current_ts - midnight_ts)
                 if is_in_bed:
-                    stats["in_bed_seconds"] = stats.get("in_bed_seconds", 0.0) + elapsed
-                else:
-                    stats["out_of_bed_seconds"] = (
-                        stats.get("out_of_bed_seconds", 0.0) + elapsed
+                    new_in_bed = min(
+                        elapsed_today,
+                        stats.get("in_bed_seconds", 0.0) + elapsed,
                     )
+                    stats["in_bed_seconds"] = new_in_bed
+                    # La somme Temps au lit + Temps hors du lit est strictement égale au temps écoulé aujourd'hui
+                    stats["out_of_bed_seconds"] = max(0.0, elapsed_today - new_in_bed)
+                else:
+                    new_out_bed = min(
+                        elapsed_today,
+                        stats.get("out_of_bed_seconds", 0.0) + elapsed,
+                    )
+                    stats["out_of_bed_seconds"] = new_out_bed
+                    stats["in_bed_seconds"] = max(0.0, elapsed_today - new_out_bed)
             else:
                 day_rollover = True
                 # Minuit en HEURE LOCALE a été franchi entre last_ts et current_ts
-                midnight_today = current_dt.replace(
-                    hour=0, minute=0, second=0, microsecond=0
-                )
-                midnight_ts = midnight_today.timestamp()
-
                 elapsed_yesterday = max(0.0, min(elapsed, midnight_ts - last_ts))
                 elapsed_today = max(0.0, current_ts - max(last_ts, midnight_ts))
 
@@ -315,7 +324,7 @@ class LitOccupancyHub:
                     )
                     stats["yesterday_in_bed_seconds"] = round(yesterday_total, 1)
                     stats["yesterday_out_bed_seconds"] = round(
-                        stats.get("out_of_bed_seconds", 0.0), 1
+                        max(0.0, 86400.0 - yesterday_total), 1
                     )
                     stats["in_bed_seconds"] = elapsed_today
                     stats["out_of_bed_seconds"] = 0.0
@@ -325,7 +334,7 @@ class LitOccupancyHub:
                     )
                     stats["yesterday_out_bed_seconds"] = round(yesterday_total, 1)
                     stats["yesterday_in_bed_seconds"] = round(
-                        stats.get("in_bed_seconds", 0.0), 1
+                        max(0.0, 86400.0 - yesterday_total), 1
                     )
                     stats["in_bed_seconds"] = 0.0
                     stats["out_of_bed_seconds"] = elapsed_today
@@ -438,21 +447,18 @@ class LitOccupancyHub:
 
                     if saved_date == today_str:
                         # Si le stockage date d'aujourd'hui :
-                        # On comble le temps éventuel passé pendant l'arrêt/redémarrage de Home Assistant
+                        # On comble le temps d'arrêt éventuel de Home Assistant (downtime).
                         elapsed_down = max(0.0, current_ts - last_saved_ts)
+                        elapsed_today = max(0.0, current_ts - midnight_ts)
+
                         if was_in_bed:
-                            # Si la personne dormait avant minuit et dort toujours aujourd'hui :
-                            # Le temps passé au lit aujourd'hui (depuis 00h00) ne peut pas être inférieur au temps écoulé depuis minuit !
-                            sleep_start = float(stats.get("sleep_start_ts") or current_ts)
-                            interr = float(stats.get("sleep_interruption_seconds", 0.0))
-                            if sleep_start < midnight_ts:
-                                elapsed_since_midnight = max(0.0, current_ts - midnight_ts - interr)
-                                in_bed_sec = max(in_bed_sec + elapsed_down, elapsed_since_midnight)
-                            else:
-                                in_bed_sec += elapsed_down
-                            out_bed_sec = 0.0
+                            in_bed_sec += elapsed_down
                         else:
                             out_bed_sec += elapsed_down
+
+                        # Réconciliation stricte : la somme Temps au lit + Hors du lit égale TOUJOURS elapsed_today
+                        in_bed_sec = min(in_bed_sec, elapsed_today)
+                        out_bed_sec = max(0.0, elapsed_today - in_bed_sec)
 
                         stats["in_bed_seconds"] = in_bed_sec
                         stats["out_of_bed_seconds"] = out_bed_sec
@@ -461,19 +467,24 @@ class LitOccupancyHub:
 
                     elif saved_date == yesterday_str:
                         # Si le stockage datait d'hier avant minuit :
-                        # Minuit a été franchi pendant le redémarrage ou avant la sauvegarde !
+                        # Minuit a été franchi pendant le redémarrage.
                         elapsed_to_midnight = max(0.0, midnight_ts - last_saved_ts)
                         elapsed_today = max(0.0, current_ts - midnight_ts)
 
                         if was_in_bed:
-                            stats["yesterday_in_bed_seconds"] = in_bed_sec + elapsed_to_midnight
-                            stats["yesterday_out_bed_seconds"] = out_bed_sec
-                            # Pour aujourd'hui (depuis 00h00) : tout le temps écoulé depuis minuit a été passé au lit
+                            yesterday_in = in_bed_sec + elapsed_to_midnight
+                            stats["yesterday_in_bed_seconds"] = round(yesterday_in, 1)
+                            stats["yesterday_out_bed_seconds"] = round(
+                                max(0.0, 86400.0 - yesterday_in), 1
+                            )
                             stats["in_bed_seconds"] = elapsed_today
                             stats["out_of_bed_seconds"] = 0.0
                         else:
-                            stats["yesterday_out_bed_seconds"] = out_bed_sec + elapsed_to_midnight
-                            stats["yesterday_in_bed_seconds"] = in_bed_sec
+                            yesterday_out = out_bed_sec + elapsed_to_midnight
+                            stats["yesterday_out_bed_seconds"] = round(yesterday_out, 1)
+                            stats["yesterday_in_bed_seconds"] = round(
+                                max(0.0, 86400.0 - yesterday_out), 1
+                            )
                             stats["in_bed_seconds"] = 0.0
                             stats["out_of_bed_seconds"] = elapsed_today
 
